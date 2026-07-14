@@ -22,6 +22,10 @@ class GDCompilerInit {
 		// Add our compiler to Reflaxe
 		ReflectCompiler.AddCompiler(new GDCompiler(), {
 			expressionPreprocessors: [
+				// Must run before the everything-is-expression sanitizer:
+				// it hoists operands without preserving && / || short-circuit
+				// semantics, so those become if-expressions first.
+				Custom(new gdcompiler.preprocessors.ShortCircuitToIf()),
 				SanitizeEverythingIsExpression({
 					convertIncrementAndDecrementOperators: true
 				}),
@@ -41,7 +45,9 @@ class GDCompilerInit {
 				// declaration, intervening reads, then a reassignment, it
 				// merges the declaration into the reassignment and leaves the
 				// earlier reads referencing an undeclared variable.
-				RemoveLocalVariableAliases,
+				// RemoveLocalVariableAliases is disabled: it merges
+				// `var alias = original` even when the alias is REASSIGNED
+				// later (do-while walk patterns), corrupting the original.
 				// MarkUnusedVariables is disabled: it asserts that a TVar id
 				// never appears in two declarations, which does not hold for
 				// typed ASTs containing inlined or duplicated declarations

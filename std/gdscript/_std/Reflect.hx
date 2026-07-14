@@ -130,10 +130,10 @@ class Reflect {
 		throw "Only anonymous structures (Dictionaries) may be used with `Reflect.copy`.";
 	}
 
+	// GDScript has no variadic callables: bind the array-taking function to
+	// a generated static dispatcher that emulates varargs.
 	@:overload(function(f:Array<Dynamic>->Void):Dynamic {})
 	public static function makeVarArgs(f: Array<Dynamic>->Dynamic): Dynamic {
-		return function(...args: Dynamic) {
-			return f(args);
-		}
+		return untyped __gdscript__("HxVarArgs.make({0})", f);
 	}
 }

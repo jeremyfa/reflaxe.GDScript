@@ -452,6 +452,40 @@ class GDCompiler extends reflaxe.DirectToStringCompiler {
 	}
 
 	/**
+		The GDScript source of the varargs emulation: GDScript has no
+		variadic callables, so Reflect.makeVarArgs wraps the function in an
+		object whose `run` method takes many defaulted parameters and packs
+		the provided ones (detected via a sentinel) into an array.
+	**/
+	function hxVarArgsRuntimeSource(): String {
+		final maxArity = 16;
+		final buf = new StringBuf();
+		buf.add("class_name HxVarArgs\n\n");
+		buf.add("# Varargs emulation for Reflect.makeVarArgs. The wrapped\n");
+		buf.add("# function is BOUND to a static dispatcher (bound arguments are\n");
+		buf.add("# appended after call arguments and keep the value alive, unlike\n");
+		buf.add("# method Callables which do not retain RefCounted targets).\n\n");
+		buf.add("const UNSET = &\"__hx_unset__\"\n\n\n");
+		buf.add("static func make(f: Callable) -> Callable:\n");
+		buf.add("\treturn Callable(HxVarArgs, \"run_static\").bind(f)\n\n\n");
+		final params = [];
+		final names = [];
+		for(i in 0...maxArity) {
+			names.push("p" + i);
+			params.push("p" + i + " = UNSET");
+		}
+		buf.add("static func run_static(" + params.join(", ") + "):\n");
+		buf.add("\tvar all := []\n");
+		buf.add("\tfor v in [" + names.join(", ") + "]:\n");
+		buf.add("\t\tif typeof(v) == TYPE_STRING_NAME and v == UNSET:\n\t\t\tbreak\n");
+		buf.add("\t\tall.append(v)\n");
+		buf.add("\t# The bound function arrives as the last provided argument.\n");
+		buf.add("\tvar f: Callable = all.pop_back()\n");
+		buf.add("\treturn f.call(all)\n");
+		return buf.toString();
+	}
+
+	/**
 		The GDScript source of the pending-exception runtime holder.
 	**/
 	function excRuntimeSource(): String {
@@ -538,6 +572,7 @@ class GDCompiler extends reflaxe.DirectToStringCompiler {
 		}
 		// HxDyn also backs Std.string, so it is always emitted.
 		setExtraFile("HxDyn.gd", hxDynRuntimeSource());
+		setExtraFile("HxVarArgs.gd", hxVarArgsRuntimeSource());
 		setExtraFile("HxType.gd", typeRegistrySource());
 		if(Context.defined(Define.GenerateGodotPlugin)) {
 			generatePlugin();
@@ -2035,6 +2070,21 @@ ${exitTreeLines.length > 0 ? exitTreeLines.join("\n").tab() : "\tpass"}
 			if(checkForPrimitiveStringAddition(e2, e1)) gdExpr1 = "HxDyn.hx_string(" + gdExpr1 + ")";
 		}
 
+		// Equality between dynamically-typed values: GDScript errors on ==
+		// with mismatched operand types (Object vs Array, ...), while Haxe
+		// equality is just false. Null-literal comparisons stay direct.
+		switch(op) {
+			case OpEq | OpNotEq: {
+				final nullLiteral = isNullLiteral(e1) || isNullLiteral(e2);
+				if(!nullLiteral && (isUntypedOperand(e1) || isUntypedOperand(e2))) {
+					hxDynUsed = true;
+					final call = "HxDyn.eq(" + gdExpr1 + ", " + gdExpr2 + ")";
+					return op == OpNotEq ? ("!" + call) : call;
+				}
+			}
+			case _:
+		}
+
 		return gdExpr1 + " " + operatorStr + " " + gdExpr2;
 	}
 
@@ -2045,6 +2095,21 @@ ${exitTreeLines.length > 0 ? exitTreeLines.join("\n").tab() : "\tpass"}
 	function isFloatModOperand(e: TypedExpr): Bool {
 		return switch(haxe.macro.TypeTools.followWithAbstracts(e.t)) {
 			case TAbstract(aRef, _): aRef.get().name == "Float" || aRef.get().name == "Single";
+			case _: false;
+		}
+	}
+
+	function isNullLiteral(e: TypedExpr): Bool {
+		return switch(e.unwrapParenthesis().expr) {
+			case TConst(TNull): true;
+			case _: false;
+		}
+	}
+
+	function isUntypedOperand(e: TypedExpr): Bool {
+		return switch(haxe.macro.TypeTools.follow(e.t)) {
+			case TDynamic(_) | TMono(_): true;
+			case TAbstract(_.get() => abs, _): abs.pack.length == 0 && (abs.name == "Any" || abs.name == "Dynamic");
 			case _: false;
 		}
 	}
@@ -2106,6 +2171,18 @@ ${exitTreeLines.length > 0 ? exitTreeLines.join("\n").tab() : "\tpass"}
 			+ "\t\t_:\n"
 			+ "\t\t\tpass\n"
 			+ "\treturn v\n\n\n"
+			+ "# Haxe-style equality: GDScript errors comparing mismatched\n"
+			+ "# Variant types (Object vs Array, ...), Haxe returns false.\n"
+			+ "static func eq(a, b) -> bool:\n"
+			+ "\tvar ta := typeof(a)\n"
+			+ "\tvar tb := typeof(b)\n"
+			+ "\tif ta == tb:\n"
+			+ "\t\treturn a == b\n"
+			+ "\tif (ta == TYPE_INT or ta == TYPE_FLOAT) and (tb == TYPE_INT or tb == TYPE_FLOAT):\n"
+			+ "\t\treturn a == b\n"
+			+ "\tif (ta == TYPE_STRING or ta == TYPE_STRING_NAME) and (tb == TYPE_STRING or tb == TYPE_STRING_NAME):\n"
+			+ "\t\treturn a == b\n"
+			+ "\treturn false\n\n\n"
 			+ "# Haxe-style string conversion: integral floats print without a\n"
 			+ "# trailing .0 (like the js target), enums print Name(params).\n"
 			+ "static func hx_string(v) -> String:\n"
