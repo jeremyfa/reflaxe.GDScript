@@ -73,6 +73,10 @@ class EnumCompiler {
 		return storesData ? AsDictionary : GDScriptEnum;
 	}
 
+	public static function enumDottedName(enumType: EnumType): String {
+		return enumType.pack.length > 0 ? enumType.pack.join(".") + "." + enumType.name : enumType.name;
+	}
+
 	public function compileExpressionFromIndex(enumType: EnumType, enumField: EnumField, exprArgsPassed: Null<Array<TypedExpr>>) {
 		if(enumType.isReflaxeExtern()) {
 			return enumType.getNameOrNative() + "." + enumField.name;
@@ -100,7 +104,10 @@ class EnumCompiler {
 					case _: [];
 				}
 
-				result.addMulti("{ \"_index\": ", Std.string(enumField.index), ", ");
+				// The _hx_enum tag identifies the enum type at runtime
+				// (Std.isOfType, Type reflection); parameters skip keys
+				// starting with an underscore.
+				result.addMulti("{ \"_hx_enum\": \"", enumDottedName(enumType), "\", \"_index\": ", Std.string(enumField.index), ", ");
 				for(i in 0...exprArgsPassed.length) {
 					if(enumFieldArgs[i] == null) {
 						continue;
@@ -114,7 +121,7 @@ class EnumCompiler {
 				result.toString();
 			}
 			case AsDictionary: {
-				"{ \"_index\": " + enumField.index + " }";
+				"{ \"_hx_enum\": \"" + enumDottedName(enumType) + "\", \"_index\": " + enumField.index + " }";
 			}
 		}
 	}

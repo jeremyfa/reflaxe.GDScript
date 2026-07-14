@@ -33,9 +33,16 @@ class GDCompilerInit {
 				RemoveSingleExpressionBlocks,
 				RemoveConstantBoolIfs,
 				RemoveUnnecessaryBlocks,
-				RemoveReassignedVariableDeclarations,
+				// RemoveReassignedVariableDeclarations is disabled: with a
+				// declaration, intervening reads, then a reassignment, it
+				// merges the declaration into the reassignment and leaves the
+				// earlier reads referencing an undeclared variable.
 				RemoveLocalVariableAliases,
-				MarkUnusedVariables,
+				// MarkUnusedVariables is disabled: it asserts that a TVar id
+				// never appears in two declarations, which does not hold for
+				// typed ASTs containing inlined or duplicated declarations
+				// (it throws "Logic error" on such input). Its only benefit
+				// is silencing unused-variable warnings in generated code.
 			],
 			fileOutputExtension: ".gd",
 			outputDirDefineName: "gdscript-output",

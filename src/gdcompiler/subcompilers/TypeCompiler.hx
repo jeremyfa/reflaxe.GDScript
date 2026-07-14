@@ -33,15 +33,41 @@ class TypeCompiler {
 	}
 
 	public function compileClassName(classType: ClassType): String {
-		// Classes in `haxe` package have simple names that might conflict, so let's use pack_Name.
-		if(classType.pack.length >= 1 && classType.pack[0] == "haxe") {
-			return classType.pack.join("_") + "_" + classType.getNameOrNativeName();
+		// Externs (Godot bindings and injected natives) keep their name.
+		if(classType.isExtern) {
+			return classType.getNameOrNativeName();
 		}
-		return classType.getNameOrNativeName();
+		// @:native / @:nativeName take the name verbatim.
+		if(classType.hasMeta(":native") || classType.hasMeta(Meta.NativeName)) {
+			return classType.getNameOrNativeName();
+		}
+		// Include the package to keep global class_name declarations unique:
+		// same-name classes in different packages would otherwise collide, and
+		// bare names can shadow Godot built-ins (Timer, Script, ...).
+		return classNamePrefix() + packPrefixedName(classType.pack, classType.name);
 	}
 
 	public function compileEnumName(enumType: EnumType): String {
-		return enumType.getNameOrNativeName();
+		if(enumType.isExtern) {
+			return enumType.getNameOrNativeName();
+		}
+		if(enumType.hasMeta(":native") || enumType.hasMeta(Meta.NativeName)) {
+			return enumType.getNameOrNativeName();
+		}
+		return classNamePrefix() + packPrefixedName(enumType.pack, enumType.name);
+	}
+
+	/**
+		Optional global prefix for generated class names, from
+		`-D gdscript_class_prefix=...`. Lets multiple generated code bases
+		coexist in one Godot project and avoids clashes with user classes.
+	**/
+	function classNamePrefix(): String {
+		return Context.definedValue("gdscript_class_prefix") ?? "";
+	}
+
+	function packPrefixedName(pack: Array<String>, name: String): String {
+		return pack.length >= 1 ? pack.join("_") + "_" + name : name;
 	}
 
 	function compileModuleType(m: ModuleType, isExport: Bool): String {
@@ -87,11 +113,28 @@ class TypeCompiler {
 			return null;
 		}
 
+		// Haxe String and Array are nullable reference types, but their
+		// GDScript counterparts are non-nullable builtins. Code that assigns
+		// or returns null through them is valid Haxe, so these compile
+		// untyped.
+		switch(t) {
+			case TInst(_.get() => cls, _) if(cls.pack.length == 0 && (cls.name == "String" || cls.name == "Array")): {
+				return null;
+			}
+			case _:
+		}
+
 		// Process and return content from @:nativeTypeCode
 		if(t.getMeta().maybeHas(":nativeTypeCode")) {
 			final params = t.getParams();
 			final paramCallbacks = if(params != null && params.length > 0) {
-				params.map(paramType -> (() -> compileType(paramType, errorPos, isExport) ?? "Variant"));
+				// GDScript does not support nested typed collections
+				// (e.g. Array[Array[int]]), so parameters that are themselves
+				// parameterized degrade to Variant.
+				params.map(paramType -> (() -> {
+					final compiled = compileType(paramType, errorPos, isExport) ?? "Variant";
+					compiled.indexOf("[") >= 0 ? "Variant" : compiled;
+				}));
 			} else {
 				[];
 			}
@@ -134,6 +177,16 @@ class TypeCompiler {
 			}
 			case TAbstract(absRef, params): {
 				final abs = absRef.get();
+
+				// Class/Enum/EnumValue have no GDScript representation
+				// (classes are Script objects, enums are Dictionaries):
+				// leave those untyped.
+				if(abs.pack.length == 0) {
+					switch(abs.name) {
+						case "Class" | "Enum" | "EnumValue": return null;
+						case _:
+					}
+				}
 
 				final primitiveResult = if(params.length == 0) {
 					switch(abs.name) {
