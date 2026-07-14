@@ -338,7 +338,9 @@ class StringTools {
 		character.
 	**/
 	public static #if !eval inline #end function fastCodeAt(s:String, index:Int):Int {
-		return untyped s.unicode_at(index);
+		// Haxe allows reading at s.length (EOF); GDScript's unicode_at
+		// errors out of bounds. -1 is this target's EOF indicator.
+		return (index >= 0 && index < s.length) ? untyped s.unicode_at(index) : -1;
 	}
 
 	/**
@@ -389,6 +391,8 @@ class StringTools {
 		#elseif (neko || lua || eval)
 		return c == null;
 		#elseif (java || python)
+		return c == -1;
+		#elseif gdscript
 		return c == -1;
 		#else
 		return false;

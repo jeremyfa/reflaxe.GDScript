@@ -138,7 +138,8 @@ class Type {
 	}
 
 	public static function enumConstructor(e: EnumValue): String {
-		return "";
+		final name: Null<String> = untyped __gdscript__("{0}.get(\"_hx_name\")", e);
+		return name != null ? name : "";
 	}
 
 	/**

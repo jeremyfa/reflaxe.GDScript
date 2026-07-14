@@ -22,11 +22,14 @@ extern class String {
 	@:nativeName("to_lower")
 	public function toLowerCase(): String;
 
-	@:nativeName("find")
-	public function indexOf(str: String, startIndex: Int = 0): Int;
-	
-	@:nativeName("substr")
-	public function substr(pos: Int, len: Int = -1): String;
+	@:runtime public inline function indexOf(str: String, ?startIndex: Int): Int {
+		// Haxe allows a null start index (meaning 0).
+		return find(str, startIndex != null ? startIndex : 0);
+	}
+
+	@:runtime public inline function substr(pos: Int, ?len: Int): String {
+		return len != null ? gdSubstr(pos, len) : gdSubstr(pos, -1);
+	}
 
 	// ----------
 	// @:native
@@ -35,8 +38,10 @@ extern class String {
 
 	// ----------
 	// @:nativeFunctionCode
-	@:nativeFunctionCode("{this}[{arg0}]")
-	public function charAt(index: Int): String;
+	@:runtime public inline function charAt(index: Int): String {
+		// Haxe returns an empty string out of bounds; GDScript errors.
+		return (index >= 0 && index < length) ? gdSubstr(index, 1) : "";
+	}
 
 	@:nativeFunctionCode("{this}")
 	public function toString(): String;
@@ -51,24 +56,18 @@ extern class String {
 		}
 	}
 
-	@:runtime public inline function lastIndexOf(str: String, startIndex: Int = -1): Int {
-		return if(startIndex < 0) {
-			rfind(str);
-		} else {
-			substring(0, startIndex + this.length).rfind(str);
-		}
+	@:runtime public inline function lastIndexOf(str: String, ?startIndex: Int): Int {
+		return startIndex != null ? rfind(str, startIndex) : rfind(str, -1);
 	}
 
 	@:runtime public inline function split(delimiter: String): Array<String> {
 		return untyped __gdscript__("Array(Array({0}.split({1})), Variant.Type.TYPE_STRING, \"\", null)", this, delimiter);
 	}
 
-	@:runtime public inline function substring(startIndex: Int, endIndex: Int = -1): String {
-		return if(endIndex < 0) {
-			substr(startIndex);
-		} else {
-			substr(startIndex, endIndex - startIndex);
-		}
+	@:runtime public inline function substring(startIndex: Int, ?endIndex: Int): String {
+		// Haxe semantics: negative indices clamp to 0, and if
+		// startIndex > endIndex the two are swapped.
+		return gdscript.internal.HxString.substring(this, startIndex, endIndex != null ? endIndex : -1);
 	}
 
 	// ----------------------------
@@ -78,7 +77,9 @@ extern class String {
 	//  fields that don't match the api to be explicitly private).
 	// ----------------------------
 	@:nativeName("unicode_at") private function unicodeAt(at: Int): Int;
-	@:nativeName("rfind") private function rfind(what: String): Int;
+	@:nativeName("rfind") private function rfind(what: String, from: Int = -1): Int;
+	@:nativeName("find") private function find(what: String, from: Int = 0): Int;
 	@:nativeName("findn") private function findNoCase(what: String, from: Int = 0): Int;
 	@:nativeName("length") private function getLength(): Int;
+	@:nativeName("substr") private function gdSubstr(pos: Int, len: Int = -1): String;
 }

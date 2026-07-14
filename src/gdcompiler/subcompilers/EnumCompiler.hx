@@ -104,10 +104,11 @@ class EnumCompiler {
 					case _: [];
 				}
 
-				// The _hx_enum tag identifies the enum type at runtime
-				// (Std.isOfType, Type reflection); parameters skip keys
-				// starting with an underscore.
-				result.addMulti("{ \"_hx_enum\": \"", enumDottedName(enumType), "\", \"_index\": ", Std.string(enumField.index), ", ");
+				// The _hx_enum/_hx_name tags identify the enum type and
+				// constructor at runtime (Std.isOfType, Std.string, Type
+				// reflection); parameters skip keys starting with an
+				// underscore.
+				result.addMulti("{ \"_hx_enum\": \"", enumDottedName(enumType), "\", \"_hx_name\": \"", enumField.name, "\", \"_index\": ", Std.string(enumField.index), ", ");
 				for(i in 0...exprArgsPassed.length) {
 					if(enumFieldArgs[i] == null) {
 						continue;
@@ -121,7 +122,7 @@ class EnumCompiler {
 				result.toString();
 			}
 			case AsDictionary: {
-				"{ \"_hx_enum\": \"" + enumDottedName(enumType) + "\", \"_index\": " + enumField.index + " }";
+				"{ \"_hx_enum\": \"" + enumDottedName(enumType) + "\", \"_hx_name\": \"" + enumField.name + "\", \"_index\": " + enumField.index + " }";
 			}
 		}
 	}

@@ -30,6 +30,10 @@ class GDCompilerInit {
 				WrapLambdaCaptureVariablesInArray({
 					wrapMetadata: [":copyType"]
 				}),
+				// GDScript lambdas capture by value: local functions that
+				// reference themselves (or are forward-referenced by earlier
+				// lambdas) must be array-wrapped to get reference semantics.
+				Custom(new gdcompiler.preprocessors.WrapRecursiveLambdas()),
 				RemoveSingleExpressionBlocks,
 				RemoveConstantBoolIfs,
 				RemoveUnnecessaryBlocks,

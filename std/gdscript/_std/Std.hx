@@ -18,8 +18,11 @@ extern class Std {
 		return untyped __gdscript__("({0} if HxType.is_of_type({0}, {1}) else null)", value, c);
 	}
 
-	@:native("str")
-	public static function string(s: Dynamic): String;
+	// Haxe-style string conversion (integral floats without trailing .0,
+	// enums as Name(params)), through the generated HxDyn runtime.
+	@:runtime public inline static function string(s: Dynamic): String {
+		return untyped __gdscript__("HxDyn.hx_string({0})", s);
+	}
 
 	@:native("int")
 	public static function int(x: Float): Int;

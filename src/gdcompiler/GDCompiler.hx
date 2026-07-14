@@ -486,14 +486,26 @@ class GDCompiler extends reflaxe.DirectToStringCompiler {
 	/**
 		Make sure "_" isn't a variable name.
 	**/
+	/**
+		GDScript keywords and built-in member names that cannot be used as
+		identifiers; valid in Haxe, so they get a suffix. Applied to both
+		declarations and accesses so renames stay consistent across classes.
+	**/
+	static final gdReservedIdentifiers = [
+		"and", "or", "not", "in", "is", "as", "if", "elif", "else", "for",
+		"while", "match", "when", "break", "continue", "pass", "return",
+		"class", "class_name", "extends", "func", "static", "const", "enum",
+		"var", "signal", "await", "void", "assert", "breakpoint", "preload",
+		"self", "super", "true", "false", "null", "tool",
+		// Built-in Object members that subclasses cannot redefine
+		"script"
+	];
+
 	public override function compileVarName(name: String, expr: Null<TypedExpr> = null, field: Null<ClassField> = null): String {
 		switch(name) {
 			case "_": return "__underscore__";
 			case "__underscore__": throw "__underscore__ is a reserved variable name in Reflaxe/GDScript.";
-			// Names of built-in Object/RefCounted members cannot be redefined
-			// on classes extending them. Applied to both declarations and
-			// accesses, so renames stay consistent across classes.
-			case "script": return "script_hx";
+			case _ if(gdReservedIdentifiers.contains(name)): return name + "_hx";
 		}
 		return super.compileVarName(name, expr, field);
 	}
@@ -521,6 +533,11 @@ class GDCompiler extends reflaxe.DirectToStringCompiler {
 		if(excUsed) {
 			setExtraFile(excClassName + ".gd", excRuntimeSource());
 		}
+		if(hxArrUsed) {
+			setExtraFile("HxArr.gd", hxArrRuntimeSource());
+		}
+		// HxDyn also backs Std.string, so it is always emitted.
+		setExtraFile("HxDyn.gd", hxDynRuntimeSource());
 		setExtraFile("HxType.gd", typeRegistrySource());
 		if(Context.defined(Define.GenerateGodotPlugin)) {
 			generatePlugin();
@@ -1030,10 +1047,14 @@ ${exitTreeLines.length > 0 ? exitTreeLines.join("\n").tab() : "\tpass"}
 						if(isConstructor) {
 							compilingInConstructor = true;
 
-							final preconstructorFieldAssignmentData = classType.extractPreconstructorFieldAssignments(expr);
-							if(preconstructorFieldAssignmentData != null) {
-								expr = preconstructorFieldAssignmentData.modifiedConstructor;
-							}
+							// Note: extractPreconstructorFieldAssignments is
+							// deliberately NOT used here. It strips leading
+							// `this.field = value` assignments from the
+							// constructor whenever the field has a default,
+							// but the value may depend on constructor
+							// arguments (`this.id = id`), which cannot move
+							// to a field initializer; the assignment was
+							// silently lost.
 						}
 
 						// Compile function
@@ -1298,7 +1319,7 @@ ${exitTreeLines.length > 0 ? exitTreeLines.join("\n").tab() : "\tpass"}
 			case TLocal(v): {
 				final renamed = localRenames.get(v.id);
 				result.add(renamed != null ? renamed : compileVarName(v.name, expr));
-				if(v.meta.maybeHas(":arrayWrap")) {
+				if(isArrayWrapped(v)) {
 					result.add("[0]");
 				}
 			}
@@ -1306,12 +1327,19 @@ ${exitTreeLines.length > 0 ? exitTreeLines.join("\n").tab() : "\tpass"}
 				result.add(compileVarName(s, expr));
 			}
 			case TArray(e1, e2): {
-				result.addMulti(compileExpressionOrError(e1), "[", compileExpressionOrError(e2), "]");
+				// Haxe array reads return null out of bounds; GDScript errors.
+				if(isHaxeArrayType(e1.t)) {
+					hxArrUsed = true;
+					result.addMulti("HxArr.get_at(", compileExpressionOrError(e1), ", ", compileExpressionOrError(e2), ")");
+				} else {
+					result.addMulti(compileExpressionOrError(e1), "[", compileExpressionOrError(e2), "]");
+				}
 			}
 			case TBinop(OpAssign, { expr: TField(e1, FAnon(classFieldRef)) }, e2): {
 				var gdExpr1 = compileExpressionOrError(e1);
 				var gdExpr2 = compileExpressionOrError(e2);
-				result.add(gdExpr1 + ".set(\"" + classFieldRef.get().name + "\", " + gdExpr2 + ")");
+				hxDynUsed = true;
+				result.add("HxDyn.set_field(" + gdExpr1 + ", \"" + classFieldRef.get().name + "\", " + gdExpr2 + ")");
 			}
 			case TBinop(op, e1, e2): {
 				result.add(binopToGDScript(op, e1, e2));
@@ -1428,9 +1456,14 @@ ${exitTreeLines.length > 0 ? exitTreeLines.join("\n").tab() : "\tpass"}
 			case TVar(tvar, maybeExpr): {
 				result.add("var ");
 				result.add(declareLocal(tvar.id, compileVarName(tvar.name, expr)));
+				// Array-wrapped variables declared without an initializer
+				// still need their array container.
+				if(maybeExpr == null && isArrayWrapped(tvar)) {
+					result.add(" = [null]");
+				}
 				if(maybeExpr != null && !maybeExpr.isStaticField("gdscript.Syntax", "NoAssign", true)) {
 					final e = compileExpressionOrError(maybeExpr);
-					if(tvar.meta.maybeHas(":arrayWrap")) {
+					if(isArrayWrapped(tvar)) {
 						result.addMulti(" = [", e, "]");	
 					} else {
 						#if !gdscript_untyped
@@ -1914,6 +1947,25 @@ ${exitTreeLines.length > 0 ? exitTreeLines.join("\n").tab() : "\tpass"}
 		var gdExpr1 = compileExpression(e1);
 		var gdExpr2 = compileExpression(e2);
 
+		// Operator precedence differs between Haxe and GDScript (comparisons
+		// are one flat left-associative level in GDScript, so
+		// `a < 0 != b < 0` parses as `((a < 0) != b) < 0`). Parenthesize
+		// operands that are themselves binary operations; redundant parens
+		// are harmless.
+		inline function isBareBinop(e: TypedExpr): Bool {
+			return switch(e.expr) {
+				case TBinop(OpAssign | OpAssignOp(_), _, _): false;
+				case TBinop(_, _, _): true;
+				case _: false;
+			}
+		}
+		final assigning = switch(op) {
+			case OpAssign | OpAssignOp(_): true;
+			case _: false;
+		}
+		if(!assigning && isBareBinop(e1) && gdExpr1 != null) gdExpr1 = "(" + gdExpr1 + ")";
+		if(isBareBinop(e2) && gdExpr2 != null) gdExpr2 = "(" + gdExpr2 + ")";
+
 		switch(op) {
 			case OpUShr: {
 				return '(($gdExpr1 & -1) >> $gdExpr2) & -1';
@@ -1928,6 +1980,18 @@ ${exitTreeLines.length > 0 ? exitTreeLines.join("\n").tab() : "\tpass"}
 						if(clsRef.get().pack.length == 0 && clsRef.get().name == "Array" && cfRef.get().name == "length"): {
 						return compileExpressionOrError(obj) + ".resize(" + gdExpr2 + ")";
 					}
+					// Haxe array writes grow the array out of bounds;
+					// GDScript errors.
+					case TArray(arr, idx) if(isHaxeArrayType(arr.t)): {
+						hxArrUsed = true;
+						return "HxArr.set_at(" + compileExpressionOrError(arr) + ", " + compileExpressionOrError(idx) + ", " + gdExpr2 + ")";
+					}
+					// Dynamic field writes: reads compile to a helper call,
+					// which is not a valid assignment target.
+					case TField(obj, FDynamic(fieldName)): {
+						hxDynUsed = true;
+						return "HxDyn.set_field(" + compileExpressionOrError(obj) + ", \"" + compileVarName(fieldName) + "\", " + gdExpr2 + ")";
+					}
 					case _:
 				}
 			}
@@ -1935,18 +1999,40 @@ ${exitTreeLines.length > 0 ? exitTreeLines.join("\n").tab() : "\tpass"}
 			case OpMod if(isFloatModOperand(e1) || isFloatModOperand(e2)): {
 				return 'fmod($gdExpr1, $gdExpr2)';
 			}
-			case OpAssignOp(OpMod) if(isFloatModOperand(e1) || isFloatModOperand(e2)): {
-				return '$gdExpr1 = fmod($gdExpr1, $gdExpr2)';
+			// Compound assignment to anonymous object fields: those read via
+			// .get(), which is not a valid assignment target.
+			case OpAssignOp(innerOp): {
+				switch(e1.expr) {
+					case TField(obj, FAnon(_.get().name => name) | FDynamic(compileVarName(_) => name)): {
+						hxDynUsed = true;
+						final objCode = compileExpressionOrError(obj);
+						final opStr = OperatorHelper.binopToString(innerOp);
+						return "HxDyn.set_field(" + objCode + ", \"" + name + "\", HxDyn.get_field(" + objCode + ", \"" + name + "\") " + opStr + " " + gdExpr2 + ")";
+					}
+					case TArray(arr, idx) if(isHaxeArrayType(arr.t)): {
+						hxArrUsed = true;
+						final arrCode = compileExpressionOrError(arr);
+						final idxCode = compileExpressionOrError(idx);
+						final opStr = OperatorHelper.binopToString(innerOp);
+						return "HxArr.set_at(" + arrCode + ", " + idxCode + ", HxArr.get_at(" + arrCode + ", " + idxCode + ") " + opStr + " " + gdExpr2 + ")";
+					}
+					case _: {
+						if(innerOp == OpMod && (isFloatModOperand(e1) || isFloatModOperand(e2))) {
+							return '$gdExpr1 = fmod($gdExpr1, $gdExpr2)';
+						}
+					}
+				}
 			}
 			case _:
 		}
 
 		final operatorStr = OperatorHelper.binopToString(op);
 
-		// Wrap primitives with str(...) when added with String
+		// Wrap primitives with Haxe-style string conversion when added
+		// with String (floats must not print a trailing .0).
 		if(op.isAddition()) {
-			if(checkForPrimitiveStringAddition(e1, e2)) gdExpr2 = "str(" + gdExpr2 + ")";
-			if(checkForPrimitiveStringAddition(e2, e1)) gdExpr1 = "str(" + gdExpr1 + ")";
+			if(checkForPrimitiveStringAddition(e1, e2)) gdExpr2 = "HxDyn.hx_string(" + gdExpr2 + ")";
+			if(checkForPrimitiveStringAddition(e2, e1)) gdExpr1 = "HxDyn.hx_string(" + gdExpr1 + ")";
 		}
 
 		return gdExpr1 + " " + operatorStr + " " + gdExpr2;
@@ -1961,6 +2047,110 @@ ${exitTreeLines.length > 0 ? exitTreeLines.join("\n").tab() : "\tpass"}
 			case TAbstract(aRef, _): aRef.get().name == "Float" || aRef.get().name == "Single";
 			case _: false;
 		}
+	}
+
+	/**
+		Set when generated code uses the HxArr bounds-safe array helper.
+	**/
+	var hxArrUsed: Bool = false;
+
+	/**
+		TVar ids of local function variables that must be array-wrapped for
+		reference-semantics capture (self/mutually recursive lambdas).
+		Filled by the WrapRecursiveLambdas preprocessor; keyed by id because
+		TVar instances may be copies that do not share metadata.
+	**/
+	public final recursiveLambdaWrapIds: Map<Int, Bool> = [];
+
+	inline function isArrayWrapped(tvar: TVar): Bool {
+		return tvar.meta.maybeHas(":arrayWrap") || recursiveLambdaWrapIds.exists(tvar.id);
+	}
+
+	/**
+		Set when generated code uses the HxDyn dynamic field access helper.
+	**/
+	var hxDynUsed: Bool = false;
+
+	/**
+		The GDScript source of the dynamic field access helper. Values typed
+		as anonymous structures in Haxe may at runtime be Dictionaries,
+		Arrays or Strings (length), or class instances.
+	**/
+	function hxDynRuntimeSource(): String {
+		return "class_name HxDyn\n\n"
+			+ "# Dynamic field access matching Haxe semantics.\n\n"
+			+ "static func get_field(o, name: String):\n"
+			+ "\tmatch typeof(o):\n"
+			+ "\t\tTYPE_DICTIONARY:\n"
+			+ "\t\t\treturn o.get(name)\n"
+			+ "\t\tTYPE_ARRAY:\n"
+			+ "\t\t\treturn o.size() if name == \"length\" else null\n"
+			+ "\t\tTYPE_STRING, TYPE_STRING_NAME:\n"
+			+ "\t\t\treturn o.length() if name == \"length\" else null\n"
+			+ "\t\tTYPE_OBJECT:\n"
+			+ "\t\t\tif o == null:\n"
+			+ "\t\t\t\treturn null\n"
+			+ "\t\t\tvar v = o.get(name)\n"
+			+ "\t\t\tif v == null and o.has_method(name):\n"
+			+ "\t\t\t\treturn Callable(o, name)\n"
+			+ "\t\t\treturn v\n"
+			+ "\t\t_:\n"
+			+ "\t\t\treturn null\n\n\n"
+			+ "static func set_field(o, name: String, v):\n"
+			+ "\tmatch typeof(o):\n"
+			+ "\t\tTYPE_DICTIONARY:\n"
+			+ "\t\t\to.set(name, v)\n"
+			+ "\t\tTYPE_OBJECT:\n"
+			+ "\t\t\tif o != null:\n"
+			+ "\t\t\t\to.set(name, v)\n"
+			+ "\t\t_:\n"
+			+ "\t\t\tpass\n"
+			+ "\treturn v\n\n\n"
+			+ "# Haxe-style string conversion: integral floats print without a\n"
+			+ "# trailing .0 (like the js target), enums print Name(params).\n"
+			+ "static func hx_string(v) -> String:\n"
+			+ "\tmatch typeof(v):\n"
+			+ "\t\tTYPE_NIL:\n"
+			+ "\t\t\treturn \"null\"\n"
+			+ "\t\tTYPE_FLOAT:\n"
+			+ "\t\t\tif v == floor(v) and absf(v) < 1e15 and is_finite(v):\n"
+			+ "\t\t\t\treturn str(int(v))\n"
+			+ "\t\t\treturn str(v)\n"
+			+ "\t\tTYPE_DICTIONARY:\n"
+			+ "\t\t\tif v.has(\"_hx_enum\"):\n"
+			+ "\t\t\t\tvar name: String = v.get(\"_hx_name\", \"\")\n"
+			+ "\t\t\t\tvar params := PackedStringArray()\n"
+			+ "\t\t\t\tfor k in v.keys():\n"
+			+ "\t\t\t\t\tif not (k as String).begins_with(\"_\"):\n"
+			+ "\t\t\t\t\t\tparams.append(hx_string(v[k]))\n"
+			+ "\t\t\t\treturn name if params.is_empty() else name + \"(\" + \",\".join(params) + \")\"\n"
+			+ "\t\t\treturn str(v)\n"
+			+ "\t\t_:\n"
+			+ "\t\t\treturn str(v)\n";
+	}
+
+	function isHaxeArrayType(t: Type): Bool {
+		return switch(haxe.macro.TypeTools.follow(t)) {
+			case TInst(_.get() => cls, _): cls.pack.length == 0 && cls.name == "Array";
+			case _: false;
+		}
+	}
+
+	/**
+		The GDScript source of the bounds-safe array access helper. Haxe
+		array reads return null out of bounds and writes grow the array;
+		GDScript subscripts error in both cases.
+	**/
+	function hxArrRuntimeSource(): String {
+		return "class_name HxArr\n\n"
+			+ "# Bounds-safe array access matching Haxe semantics.\n\n"
+			+ "static func get_at(a, i):\n"
+			+ "\treturn a[i] if i >= 0 and i < a.size() else null\n\n\n"
+			+ "static func set_at(a, i, v):\n"
+			+ "\tif i >= a.size():\n"
+			+ "\t\ta.resize(i + 1)\n"
+			+ "\ta[i] = v\n"
+			+ "\treturn v\n";
 	}
 
 	function callToGDScript(calledExpr: TypedExpr, arguments: Array<TypedExpr>, originalExpr: TypedExpr): StringBuf {
@@ -2019,6 +2209,21 @@ ${exitTreeLines.length > 0 ? exitTreeLines.join("\n").tab() : "\tpass"}
 		if(code != null) {
 			result.add(code);
 		} else {
+			// Dynamic field CALLS dispatch directly (native methods reached
+			// through untyped access); reads compile through HxDyn instead.
+			switch(calledExpr.unwrapParenthesis().expr) {
+				case TField(obj, FDynamic(fieldName)): {
+					result.add(compileExpressionOrError(obj));
+					result.add(".");
+					result.add(compileVarName(fieldName));
+					result.add("(");
+					result.add(arguments.map(e -> compileCallArg(e)).join(", "));
+					result.add(")");
+					return result;
+				}
+				case _:
+			}
+
 			final callOp = if(isCallableVar(calledExpr)) {
 				".call(";
 			} else {
@@ -2170,11 +2375,20 @@ ${exitTreeLines.length > 0 ? exitTreeLines.join("\n").tab() : "\tpass"}
 
 		// OpIncrement and OpDecrement not supported in GDScript
 		switch(op) {
-			case OpIncrement: {
-				return gdExpr + " += 1";
-			}
-			case OpDecrement: {
-				return gdExpr + " -= 1";
+			case OpIncrement | OpDecrement: {
+				final opStr = op == OpIncrement ? "+" : "-";
+				// Anonymous object fields read via a helper, which is not a
+				// valid assignment target; write back through the helper.
+				switch(e.unwrapParenthesis().expr) {
+					case TField(obj, FAnon(cfRef)): {
+						hxDynUsed = true;
+						final objCode = compileExpressionOrError(obj);
+						final name = cfRef.get().name;
+						return "HxDyn.set_field(" + objCode + ", \"" + name + "\", HxDyn.get_field(" + objCode + ", \"" + name + "\") " + opStr + " 1)";
+					}
+					case _:
+				}
+				return gdExpr + " " + opStr + "= 1";
 			}
 			case _:
 		}
@@ -2304,11 +2518,18 @@ ${exitTreeLines.length > 0 ? exitTreeLines.join("\n").tab() : "\tpass"}
 				case RemoveFieldAccess: return name;
 			}
 
-			// Check if we're accessing an anonymous type.
-			// If so, it's a Dictionary in GDScript and .get should be used.
+			// Anonymous/dynamic field reads go through a runtime helper:
+			// the value may be a Dictionary (anon object, where a missing
+			// key must read as null), an Array or String (length), or a
+			// class instance (property or method).
 			switch(fa) {
 				case FAnon(classFieldRef): {
-					return gdExpr + ".get(\"" + classFieldRef.get().name + "\")";
+					hxDynUsed = true;
+					return "HxDyn.get_field(" + gdExpr + ", \"" + classFieldRef.get().name + "\")";
+				}
+				case FDynamic(fieldName): {
+					hxDynUsed = true;
+					return "HxDyn.get_field(" + gdExpr + ", \"" + compileVarName(fieldName) + "\")";
 				}
 				case _:
 			}
