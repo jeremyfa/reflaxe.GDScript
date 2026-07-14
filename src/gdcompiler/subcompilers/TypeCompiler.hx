@@ -41,10 +41,7 @@ class TypeCompiler {
 		if(classType.hasMeta(":native") || classType.hasMeta(Meta.NativeName)) {
 			return classType.getNameOrNativeName();
 		}
-		// Include the package to keep global class_name declarations unique:
-		// same-name classes in different packages would otherwise collide, and
-		// bare names can shadow Godot built-ins (Timer, Script, ...).
-		return classNamePrefix() + packPrefixedName(classType.pack, classType.name);
+		return emittedName(classType);
 	}
 
 	public function compileEnumName(enumType: EnumType): String {
@@ -54,7 +51,7 @@ class TypeCompiler {
 		if(enumType.hasMeta(":native") || enumType.hasMeta(Meta.NativeName)) {
 			return enumType.getNameOrNativeName();
 		}
-		return classNamePrefix() + packPrefixedName(enumType.pack, enumType.name);
+		return emittedName(enumType);
 	}
 
 	/**
@@ -62,12 +59,117 @@ class TypeCompiler {
 		`-D gdscript_class_prefix=...`. Lets multiple generated code bases
 		coexist in one Godot project and avoids clashes with user classes.
 	**/
-	function classNamePrefix(): String {
+	public function classNamePrefix(): String {
 		return Context.definedValue("gdscript_class_prefix") ?? "";
 	}
 
 	function packPrefixedName(pack: Array<String>, name: String): String {
 		return pack.length >= 1 ? pack.join("_") + "_" + name : name;
+	}
+
+	// =======================================================
+	// * Name registry
+	//
+	// Global class_name declarations must be unique and should stay short.
+	// A table over ALL module types resolves each generated type to its
+	// plain name when unambiguous, escalating deterministically on
+	// collision: plain name -> package-qualified -> module-qualified.
+	// The optional `gdscript_class_prefix` is applied on top, and
+	// `-D gdscript_qualified_names` restores always-qualified names.
+	// =======================================================
+
+	/**
+		All module types of the compilation, provided by
+		`GDCompiler.filterTypes` before anything compiles.
+	**/
+	var allModuleTypes: Null<Array<ModuleType>> = null;
+
+	/**
+		Resolved (unprefixed) name per type key; built lazily.
+	**/
+	var nameTable: Null<Map<String, String>> = null;
+
+	public function setModuleTypes(types: Array<ModuleType>) {
+		allModuleTypes = types;
+		nameTable = null;
+	}
+
+	static function nameTableKey(bt: BaseType): String {
+		return bt.module + "|" + bt.name;
+	}
+
+	/**
+		The emitted global name for a generated (non-extern) type. Falls back
+		to the package-qualified form when the type is unknown to the table.
+	**/
+	public function emittedName(bt: BaseType): String {
+		if(nameTable == null) {
+			buildNameTable();
+		}
+		final resolved = nameTable != null ? nameTable.get(nameTableKey(bt)) : null;
+		return classNamePrefix() + (resolved ?? packPrefixedName(bt.pack, bt.name));
+	}
+
+	function buildNameTable() {
+		nameTable = [];
+		if(allModuleTypes == null) return;
+
+		final alwaysQualified = #if eval Context.defined("gdscript_qualified_names") #else false #end;
+
+		final entries: Array<BaseType> = [];
+		for(m in allModuleTypes) {
+			final bt: Null<BaseType> = switch(m) {
+				case TClassDecl(c): {
+					final cls = c.get();
+					(cls.isExtern || cls.hasMeta(":native") || cls.hasMeta(Meta.NativeName)) ? null : (cls : BaseType);
+				}
+				case TEnumDecl(e): {
+					final en = e.get();
+					(en.isExtern || en.hasMeta(":native") || en.hasMeta(Meta.NativeName)) ? null : (en : BaseType);
+				}
+				case _: null;
+			}
+			if(bt != null) entries.push(bt);
+		}
+
+		// Tier 1: plain names where unambiguous (also avoid the runtime
+		// helper names emitted by the compiler itself).
+		final reserved = ["HxExc", "HxDyn", "HxArr", "HxVarArgs", "HxType", "HxAutoLoad"];
+		final byName = new Map<String, Array<BaseType>>();
+		for(bt in entries) {
+			final list = byName.get(bt.name);
+			if(list != null) list.push(bt);
+			else byName.set(bt.name, [bt]);
+		}
+
+		final tier2: Array<BaseType> = [];
+		for(name => list in byName) {
+			if(!alwaysQualified && list.length == 1 && !reserved.contains(name)) {
+				nameTable.set(nameTableKey(list[0]), name);
+			} else {
+				for(bt in list) tier2.push(bt);
+			}
+		}
+
+		// Tier 2: package-qualified; tier 3 (same package, different
+		// modules): module-qualified.
+		final byQualified = new Map<String, Array<BaseType>>();
+		for(bt in tier2) {
+			final qualified = packPrefixedName(bt.pack, bt.name);
+			final list = byQualified.get(qualified);
+			if(list != null) list.push(bt);
+			else byQualified.set(qualified, [bt]);
+		}
+		for(qualified => list in byQualified) {
+			if(list.length == 1) {
+				nameTable.set(nameTableKey(list[0]), qualified);
+			} else {
+				for(bt in list) {
+					final moduleId = StringTools.replace(bt.module, ".", "_");
+					nameTable.set(nameTableKey(bt), moduleId + "_" + bt.name);
+				}
+			}
+		}
 	}
 
 	function compileModuleType(m: ModuleType, isExport: Bool): String {

@@ -603,6 +603,36 @@ class GDCompiler extends reflaxe.DirectToStringCompiler {
 		return super.compileVarName(name, expr, field);
 	}
 
+	/**
+		Provides the full module list to the naming table before anything
+		compiles, so global class names can be resolved collision-free.
+	**/
+	public override function filterTypes(moduleTypes: Array<ModuleType>): Array<ModuleType> {
+		typeCompiler.setModuleTypes(moduleTypes);
+		return moduleTypes;
+	}
+
+	/**
+		Final pass over every generated code file. When a class prefix is
+		set, rewrites references to the compiler-emitted runtime helpers
+		(HxExc, HxDyn, ...) so several generated code bases can coexist in
+		one project; this also covers helper references inside injected
+		`__gdscript__` code from the standard library. Optionally prepends
+		an internal-code notice (-D gdscript_internal_note).
+	**/
+	function finalizeGeneratedCode(code: String): String {
+		var result = code;
+		final prefix = typeCompiler.classNamePrefix();
+		if(prefix.length > 0) {
+			final helperNames = ~/\b(HxExc|HxDyn|HxArr|HxVarArgs|HxType|HxAutoLoad)\b/g;
+			result = helperNames.map(result, r -> prefix + r.matched(1));
+		}
+		if(#if eval Context.defined("gdscript_internal_note") #else false #end) {
+			result = "# Generated code - internal, do not use directly.\n" + result;
+		}
+		return result;
+	}
+
 	public function hasAutoLoad() {
 		return extraFileExists(autoLoadName + ".gd");
 	}
@@ -623,16 +653,20 @@ class GDCompiler extends reflaxe.DirectToStringCompiler {
 		Generates the Godot plugin if `-D generate_godot_plugin` is defined.
 	**/
 	public override function onCompileEnd() {
+		// Runtime helper files carry the class prefix like every other
+		// generated file (their sources are rewritten by
+		// finalizeGeneratedCode, including their class_name lines).
+		final prefix = typeCompiler.classNamePrefix();
 		if(excUsed) {
-			setExtraFile(excClassName + ".gd", excRuntimeSource());
+			setExtraFile(prefix + excClassName + ".gd", finalizeGeneratedCode(excRuntimeSource()));
 		}
 		if(hxArrUsed) {
-			setExtraFile("HxArr.gd", hxArrRuntimeSource());
+			setExtraFile(prefix + "HxArr.gd", finalizeGeneratedCode(hxArrRuntimeSource()));
 		}
 		// HxDyn also backs Std.string, so it is always emitted.
-		setExtraFile("HxDyn.gd", hxDynRuntimeSource());
-		setExtraFile("HxVarArgs.gd", hxVarArgsRuntimeSource());
-		setExtraFile("HxType.gd", typeRegistrySource());
+		setExtraFile(prefix + "HxDyn.gd", finalizeGeneratedCode(hxDynRuntimeSource()));
+		setExtraFile(prefix + "HxVarArgs.gd", finalizeGeneratedCode(hxVarArgsRuntimeSource()));
+		setExtraFile(prefix + "HxType.gd", finalizeGeneratedCode(typeRegistrySource()));
 		if(Context.defined(Define.GenerateGodotPlugin)) {
 			generatePlugin();
 		}
@@ -1303,7 +1337,7 @@ ${exitTreeLines.length > 0 ? exitTreeLines.join("\n").tab() : "\tpass"}
 		final path = getPathForBaseType(classType);
 
 		// Generate file
-		setExtraFile(path, gdscriptContent);
+		setExtraFile(path, finalizeGeneratedCode(gdscriptContent));
 
 		#if (eval && reflaxe_gdscript_measure)
 		classMeasure.measure("Reflaxe " + classType.name + " compiled in %MILLI% milliseconds");
@@ -1329,17 +1363,12 @@ ${exitTreeLines.length > 0 ? exitTreeLines.join("\n").tab() : "\tpass"}
 	}
 
 	function getGDOutputPath(baseType: BaseType) {
-		// File names must be unique across packages: globalName() drops the
-		// package for module main types, so haxe.Json and loreline.Json
-		// would both write Json.gd, one overwriting the other. Qualify with
-		// the package (matching compiled class names).
-		final prefix = Context.definedValue("gdscript_class_prefix") ?? "";
-		var path = prefix + (baseType.pack.length > 0 ? baseType.pack.join("_") + "_" : "") + baseType.globalName() + ".gd";
+		// The file name matches the emitted class_name exactly: the naming
+		// table already guarantees global uniqueness across packages
+		// (haxe.Json vs loreline.Json, module sub-types, ...).
+		var path = typeCompiler.emittedName(baseType) + ".gd";
 		#if gdscript_output_dirs
 		if(baseType.pack.length > 0) {
-			#if !gdscript_always_packages_in_output_filenames
-			path = baseType.name + ".gd";
-			#end
 			path = baseType.pack.join("/") + "/" + path;
 		}
 		#end
