@@ -99,6 +99,286 @@ class GDCompiler extends reflaxe.DirectToStringCompiler {
 	**/
 	var compilingInConstructor: Bool = false;
 
+	/**
+		Exception lowering state.
+
+		GDScript has no exceptions, so `throw`/`try`/`catch` are lowered to a
+		"pending exception" scheme: `throw` stores the thrown value in the
+		generated `HxExc` singleton and unwinds by returning a default value,
+		while every statement that may throw is followed by a check that
+		propagates the pending exception. `try` blocks compile to a
+		single-iteration `while true:` (the only break target GDScript offers)
+		so the checks can unwind to the matching catch dispatch with `break`.
+	**/
+	var excUsed: Bool = false;
+
+	/**
+		Default return value (as GDScript code) for each enclosing function
+		being compiled. `null` entry means the function returns void.
+	**/
+	var excFuncStack: Array<Null<String>> = [];
+
+	/**
+		Active lowered `try` contexts within the current function.
+	**/
+	var excTryStack: Array<{ ctrl: String, ret: String, loopDepth: Int }> = [];
+
+	/**
+		Unique id source for lowered try-block variables.
+	**/
+	var excTryCounter: Int = 0;
+
+	/**
+		Number of real loops enclosing the expression currently being
+		compiled, within the current function. Used to decide whether a
+		lowered try's control dispatch can legally re-emit break/continue.
+	**/
+	var excFuncLoopDepth: Int = 0;
+
+	static final excClassName = "HxExc";
+
+	function excCurrentTry(): Null<{ ctrl: String, ret: String, loopDepth: Int }> {
+		return excTryStack.length > 0 ? excTryStack[excTryStack.length - 1] : null;
+	}
+
+	/**
+		GDScript default value for a compiled type, used to satisfy typed
+		returns when unwinding. Typed builtins are non-nullable in GDScript.
+	**/
+	function excDefaultForType(t: Null<Type>, pos: Position): Null<String> {
+		if(t == null) return "null";
+		if(t.isVoid()) return null;
+		final compiled = typeCompiler.compileType(t, pos);
+		if(compiled == null) return "null";
+		return switch(compiled) {
+			case "int": "0";
+			case "float": "0.0";
+			case "bool": "false";
+			case "String": "\"\"";
+			case "StringName": "&\"\"";
+			case "Dictionary": "{}";
+			case _:
+				if(StringTools.startsWith(compiled, "Array")) "[]";
+				else "null";
+		}
+	}
+
+	/**
+		The line used to leave the current context when a pending exception
+		must propagate: `break` out to the nearest lowered try dispatch, or
+		return the function's default value.
+	**/
+	function excUnwindLine(): String {
+		if(excCurrentTry() != null) return "break";
+		return excReturnLine(null);
+	}
+
+	/**
+		A `return` respecting the current function's default value.
+		Pass `valueName` to return an explicit value instead.
+	**/
+	function excReturnLine(valueName: Null<String>): String {
+		if(valueName != null) return "return " + valueName;
+		final def = excFuncStack.length > 0 ? excFuncStack[excFuncStack.length - 1] : "null";
+		return def == null ? "return" : "return " + def;
+	}
+
+	/**
+		Compiles a `break` statement, rerouting through the lowered try
+		protocol when the nearest enclosing loop is a try wrapper.
+	**/
+	function excEmitBreak(): String {
+		final t = excCurrentTry();
+		if(t != null && t.loopDepth == 0) {
+			return t.ctrl + " = 1\nbreak";
+		}
+		return "break";
+	}
+
+	/**
+		Compiles a `continue` statement, rerouting through the lowered try
+		protocol when the nearest enclosing loop is a try wrapper.
+	**/
+	function excEmitContinue(): String {
+		final t = excCurrentTry();
+		if(t != null && t.loopDepth == 0) {
+			return t.ctrl + " = 2\nbreak";
+		}
+		return "continue";
+	}
+
+	/**
+		Compiles a `return` statement, rerouting through the lowered try
+		protocol when inside a lowered try body.
+	**/
+	function excEmitReturn(compiledValue: Null<String>): String {
+		final t = excCurrentTry();
+		if(t != null) {
+			var result = "";
+			if(compiledValue != null) {
+				result += t.ret + " = " + compiledValue + "\n";
+			}
+			result += t.ctrl + " = 3\nbreak";
+			return result;
+		}
+		return compiledValue != null ? "return " + compiledValue : excReturnLine(null);
+	}
+
+	/**
+		Returns `true` if evaluating this expression may set the pending
+		exception flag. Conservative: any call or construction into compiled
+		Haxe code counts. Calls to extern (native Godot) methods cannot throw
+		a Haxe exception, except `Callable` invocations which may run
+		compiled closures.
+	**/
+	function excExprCanThrow(expr: TypedExpr): Bool {
+		var found = false;
+		function walk(e: TypedExpr) {
+			if(found) return;
+			switch(e.expr) {
+				case TFunction(_): // declaration only, body does not run here
+				case TThrow(_): found = true;
+				case TNew(_, _, el): {
+					found = true;
+				}
+				case TCall(callee, el): {
+					if(excCalleeCanThrow(callee)) {
+						found = true;
+					} else {
+						walk(callee);
+						for(a in el) walk(a);
+					}
+				}
+				case _: haxe.macro.TypedExprTools.iter(e, walk);
+			}
+		}
+		walk(expr);
+		return found;
+	}
+
+	function excCalleeCanThrow(callee: TypedExpr): Bool {
+		return switch(callee.unwrapParenthesis().expr) {
+			case TField(_, FInstance(clsRef, _, cfRef) | FStatic(clsRef, cfRef)): {
+				final cls = clsRef.get();
+				if(!cls.isExtern) {
+					true;
+				} else {
+					// Callable.call and friends may invoke compiled closures.
+					final name = cfRef.get().name;
+					cls.name == "Callable" || name == "call" || name == "callv" || name == "call_deferred";
+				}
+			}
+			case TField(_, FEnum(_, _)): false; // enum constructor: pure data
+			case _: true;
+		}
+	}
+
+	/**
+		Lines to append after a compiled statement to propagate pending
+		exceptions (and, for loops inside lowered try bodies, control-flow
+		signals that used `break` to leave inner loops).
+	**/
+	function excPostStatement(stmt: TypedExpr): Null<String> {
+		final t = excCurrentTry();
+		var inner = stmt;
+		var isLoop = false;
+		while(true) {
+			switch(inner.expr) {
+				case TMeta(_, e) | TParenthesis(e): inner = e;
+				case TWhile(_, _, _) | TFor(_, _, _): isLoop = true; break;
+				case _: break;
+			}
+		}
+		final canThrow = excExprCanThrow(stmt);
+		final canUnwind = excFuncStack.length > 0 || t != null;
+
+		if(t != null && isLoop) {
+			// A return/break/continue (or pending exception) inside the loop
+			// only broke out of the loop itself; keep unwinding to the wrapper.
+			excUsed = true;
+			final cond = canThrow ? (t.ctrl + " != 0 or " + excClassName + ".active") : (t.ctrl + " != 0");
+			return "if " + cond + ":\n\tbreak";
+		}
+		if(canThrow && canUnwind) {
+			excUsed = true;
+			return "if " + excClassName + ".active:\n\t" + excUnwindLine();
+		}
+		return null;
+	}
+
+	/**
+		Compiles a statement and appends exception propagation checks.
+	**/
+	function excCompileStatement(stmt: TypedExpr): Null<String> {
+		final code = compileExpression(stmt);
+		if(code == null) return null;
+		final suffix = excPostStatement(stmt);
+		return suffix != null ? (code + "\n" + suffix) : code;
+	}
+
+	/**
+		Mirrors `DirectToStringCompiler.compileExpressionsIntoLines`, adding
+		pending-exception propagation checks after each statement. Used for
+		function bodies and variable initializer blocks.
+	**/
+	public override function compileClassVarExpr(expr: TypedExpr): String {
+		final exprList = expr.unwrapBlock();
+		var currentType = -1;
+		final lines = [];
+
+		injectionAllowed = true;
+
+		for(e in exprList) {
+			final newType = expressionType(e);
+			if(currentType != newType) {
+				if(currentType != -1) lines.push("");
+				currentType = newType;
+			}
+
+			final output = compileExpression(e, true);
+
+			final preExpr = prefixExpressionContent(e, output);
+			if(preExpr != null) {
+				for(p in preExpr) {
+					lines.push(formatExpressionLine(p));
+				}
+			}
+
+			if(output != null) {
+				lines.push(formatExpressionLine(output));
+				final suffix = excPostStatement(e);
+				if(suffix != null) {
+					lines.push(suffix);
+				}
+			}
+
+			if(injectionContent.length > 0) {
+				injectionContent = [];
+			}
+		}
+
+		injectionAllowed = false;
+
+		return lines.join("\n");
+	}
+
+	/**
+		The GDScript source of the pending-exception runtime holder.
+	**/
+	function excRuntimeSource(): String {
+		return "class_name " + excClassName + "\n\n"
+			+ "# Pending-exception state for lowered Haxe try/catch/throw.\n"
+			+ "# `throw` stores the value here and unwinds by returning default\n"
+			+ "# values; compiled code checks `active` after each call that may\n"
+			+ "# throw and keeps unwinding until a catch dispatch consumes it.\n\n"
+			+ "static var val = null\n"
+			+ "static var active: bool = false\n\n\n"
+			+ "static func throw_val(v) -> Variant:\n"
+			+ "\tval = v\n"
+			+ "\tactive = true\n"
+			+ "\treturn null\n";
+	}
+
 	#if generate_resource_export_list
 	/**
 		A list of resources preloaded by the code.
@@ -145,6 +425,9 @@ class GDCompiler extends reflaxe.DirectToStringCompiler {
 		Generates the Godot plugin if `-D generate_godot_plugin` is defined.
 	**/
 	public override function onCompileEnd() {
+		if(excUsed) {
+			setExtraFile(excClassName + ".gd", excRuntimeSource());
+		}
 		if(Context.defined(Define.GenerateGodotPlugin)) {
 			generatePlugin();
 		}
@@ -642,7 +925,22 @@ ${exitTreeLines.length > 0 ? exitTreeLines.join("\n").tab() : "\tpass"}
 						final me = new MeasurePerformance();
 						#end
 
+						// Exception lowering context: default return value for
+						// unwinds, isolated try state per function body.
+						excFuncStack.push(isConstructor ? null : excDefaultForType(f.ret, field.pos));
+						final savedTryStack = excTryStack;
+						final savedTryCounter = excTryCounter;
+						final savedLoopDepth = excFuncLoopDepth;
+						excTryStack = [];
+						excTryCounter = 0;
+						excFuncLoopDepth = 0;
+
 						var result = compileClassFuncExpr(expr).tab();
+
+						excFuncStack.pop();
+						excTryStack = savedTryStack;
+						excTryCounter = savedTryCounter;
+						excFuncLoopDepth = savedLoopDepth;
 
 						#if (eval && reflaxe_gdscript_measure)
 						me.measure("expr is %MILLI%");
@@ -931,7 +1229,23 @@ ${exitTreeLines.length > 0 ? exitTreeLines.join("\n").tab() : "\tpass"}
 				#end
 
 				result.add(":\n");
+
+				// Exception lowering context: closures unwind with their own
+				// return default and never share the enclosing try state.
+				excFuncStack.push(excDefaultForType(tfunc.t, expr.pos));
+				final savedTryStack = excTryStack;
+				final savedTryCounter = excTryCounter;
+				final savedLoopDepth = excFuncLoopDepth;
+				excTryStack = [];
+				excTryCounter = 0;
+				excFuncLoopDepth = 0;
+
 				result.add(toIndentedScope(tfunc.expr));
+
+				excFuncStack.pop();
+				excTryStack = savedTryStack;
+				excTryCounter = savedTryCounter;
+				excFuncLoopDepth = savedLoopDepth;
 			}
 			case TVar(tvar, maybeExpr): {
 				result.add("var ");
@@ -958,7 +1272,7 @@ ${exitTreeLines.length > 0 ? exitTreeLines.join("\n").tab() : "\tpass"}
 				if(el.length > 0) {
 					result.add(
 						el
-						.map(e -> compileExpression(e))
+						.map(e -> excCompileStatement(e))
 						.filter(e -> e != null)
 						.map(e -> e.trustMe().tab())
 						.join("\n")
@@ -971,7 +1285,12 @@ ${exitTreeLines.length > 0 ? exitTreeLines.join("\n").tab() : "\tpass"}
 				result.addMulti(
 					"for ", tvar.name, " in ", compileExpressionOrError(iterExpr), ":\n"
 				);
+				final t = excCurrentTry();
+				if(t != null) t.loopDepth++;
+				excFuncLoopDepth++;
 				result.add(toIndentedScope(blockExpr));
+				excFuncLoopDepth--;
+				if(t != null) t.loopDepth--;
 			}
 			case TIf(econd, ifExpr, elseExpr): {
 				result.addMulti("if ", compileExpressionOrError(econd), ":\n");
@@ -983,11 +1302,18 @@ ${exitTreeLines.length > 0 ? exitTreeLines.join("\n").tab() : "\tpass"}
 				}
 			}
 			case TWhile(econd, blockExpr, normalWhile): {
+				final t = excCurrentTry();
 				if(normalWhile) {
 					final gdCond = compileExpressionOrError(econd);
 					result.addMulti("while ", gdCond, ":\n");
+					if(t != null) t.loopDepth++;
+					excFuncLoopDepth++;
 					result.add(toIndentedScope(blockExpr));
+					excFuncLoopDepth--;
+					if(t != null) t.loopDepth--;
 				} else {
+					if(t != null) t.loopDepth++;
+					excFuncLoopDepth++;
 					final gdCond = compileExpressionOrError({
 						expr: TUnop(Unop.OpNot, false, econd),
 						pos: econd.pos,
@@ -997,6 +1323,8 @@ ${exitTreeLines.length > 0 ? exitTreeLines.join("\n").tab() : "\tpass"}
 					result.add(toIndentedScope(blockExpr));
 					result.addMulti("\n\tif ", gdCond, ":\n");
 					result.add("\t\tbreak");
+					excFuncLoopDepth--;
+					if(t != null) t.loopDepth--;
 				}
 			}
 			case TSwitch(e, cases, edef): {
@@ -1040,25 +1368,31 @@ ${exitTreeLines.length > 0 ? exitTreeLines.join("\n").tab() : "\tpass"}
 				}
 			}
 			case TTry(e, catches): {
-				result.add(compileExpressionOrError(e));
-				final msg = "GDScript does not support try-catch. The expressions contained in the try block will be compiled, and the catches will be ignored.";
-				Context.warning(msg, expr.pos);
+				result.add(compileTryToGDScript(e, catches));
 			}
 			case TReturn(maybeExpr): {
-				result.add("return");
-				if(maybeExpr != null) {
-					result.add(" ");
-					result.add(compileExpression(maybeExpr));
+				if(excTryStack.length > 0) {
+					result.add(excEmitReturn(maybeExpr != null ? compileExpression(maybeExpr) : null));
+				} else {
+					result.add("return");
+					if(maybeExpr != null) {
+						result.add(" ");
+						result.add(compileExpression(maybeExpr));
+					}
 				}
 			}
 			case TBreak: {
-				result.add("break");
+				result.add(excEmitBreak());
 			}
 			case TContinue: {
-				result.add("continue");
+				result.add(excEmitContinue());
 			}
-			case TThrow(expr): {
-				result.addMulti("assert(false, str(", compileExpressionOrError(expr), "))");
+			case TThrow(thrownExpr): {
+				// Store the pending exception; the statement-level check right
+				// after this expression performs the actual unwind. Compiling
+				// as a call keeps this valid in both statement and value position.
+				excUsed = true;
+				result.addMulti(excClassName, ".throw_val(", compileExpressionOrError(thrownExpr), ")");
 			}
 			case TCast(expr, maybeModuleType): {
 				final hasModuleType = maybeModuleType != null;
@@ -1121,26 +1455,156 @@ ${exitTreeLines.length > 0 ? exitTreeLines.join("\n").tab() : "\tpass"}
 		final result = new StringBuf();
 		switch(e.expr) {
 			case TBlock(el): {
-				if(el.length > 0) {
-					for(i in 0...el.length) {
-						final code = compileExpression(el[i]);
-						if(code != null) {
-							result.add(code.tab());
-							if(i < el.length - 1) {
-								result.add("\n");
-							}
+				var empty = true;
+				for(i in 0...el.length) {
+					final code = excCompileStatement(el[i]);
+					if(code != null) {
+						if(!empty) {
+							result.add("\n");
 						}
+						empty = false;
+						result.add(code.tab());
 					}
-				} else {
+				}
+				if(empty) {
 					result.add("\tpass");
 				}
 			}
 			case _: {
-				final gdscript = compileExpression(e) ?? "pass";
+				final gdscript = excCompileStatement(e) ?? "pass";
 				result.add(gdscript.tab());
 			}
 		}
 		return result;
+	}
+
+	/**
+		Lowers a `try`/`catch` to GDScript. The try body runs inside a
+		single-iteration `while true:` so pending-exception checks and
+		control-flow statements can unwind with `break`; a dispatch block
+		after the loop handles catches and re-emits control flow.
+	**/
+	function compileTryToGDScript(e: TypedExpr, catches: Array<{ v: TVar, expr: TypedExpr }>): String {
+		excUsed = true;
+		final id = excTryCounter++;
+		final ctrl = "_hx_ctrl" + id;
+		final ret = "_hx_ret" + id;
+		final eName = "_hx_e" + id;
+		final result = new StringBuf();
+
+		result.add("var " + ctrl + ": int = 0\n");
+		result.add("var " + ret + " = null\n");
+		result.add("while true:\n");
+		excTryStack.push({ ctrl: ctrl, ret: ret, loopDepth: 0 });
+		result.add(toIndentedScope(e).toString());
+		excTryStack.pop();
+		result.add("\n\tbreak\n");
+
+		// Catch dispatch. Compiled outside the try context: a throw inside a
+		// catch body propagates outward, per Haxe semantics.
+		result.add("if " + excClassName + ".active:\n");
+		final dispatch = new StringBuf();
+		dispatch.add("var " + eName + " = " + excClassName + ".val\n");
+		var first = true;
+		var hasCatchAll = false;
+		for(c in catches) {
+			final cond = excCatchCondition(c.v.t, eName);
+			if(cond == null) {
+				hasCatchAll = true;
+				dispatch.add(first ? "if true:\n" : "else:\n");
+			} else {
+				dispatch.add((first ? "if " : "elif ") + cond + ":\n");
+			}
+			first = false;
+
+			dispatch.add("\t" + excClassName + ".active = false\n");
+			dispatch.add("\t" + excClassName + ".val = null\n");
+			dispatch.add("\tvar " + compileVarName(c.v.name) + " = " + eName + "\n");
+			dispatch.add(toIndentedScope(c.expr).toString());
+			dispatch.add("\n");
+			if(hasCatchAll) break;
+		}
+		if(!hasCatchAll) {
+			// No catch matched: keep the exception pending and unwind further.
+			dispatch.add("if " + excClassName + ".active:\n");
+			dispatch.add(indentLines(excUnwindLine(), 1));
+			dispatch.add("\n");
+		}
+		result.add(indentLines(dispatch.toString(), 1));
+		result.add("\n");
+
+		// Re-emit control flow that unwound out of the try body. Break and
+		// continue can only occur when the try sits inside a real loop or an
+		// outer lowered try (whose wrapper is a loop).
+		final isVoidFunc = excFuncStack.length > 0 && excFuncStack[excFuncStack.length - 1] == null;
+		if(excFuncLoopDepth > 0 || excTryStack.length > 0) {
+			result.add("if " + ctrl + " == 1:\n");
+			result.add(indentLines(excEmitBreak(), 1));
+			result.add("\nelif " + ctrl + " == 2:\n");
+			result.add(indentLines(excEmitContinue(), 1));
+			result.add("\nelif " + ctrl + " == 3:\n");
+			result.add(indentLines(excEmitReturn(isVoidFunc ? null : ret), 1));
+		} else {
+			result.add("if " + ctrl + " == 3:\n");
+			result.add(indentLines(excEmitReturn(isVoidFunc ? null : ret), 1));
+		}
+
+		return result.toString();
+	}
+
+	/**
+		Indents every line of `code` by `tabs` tab characters.
+	**/
+	function indentLines(code: String, tabs: Int): String {
+		var prefix = "";
+		for(_ in 0...tabs) prefix += "\t";
+		return code.split("\n").map(l -> l.length > 0 ? prefix + l : l).join("\n");
+	}
+
+	/**
+		GDScript condition testing whether the pending exception value matches
+		a catch clause type. Returns `null` for catch-all clauses.
+	**/
+	function excCatchCondition(t: Type, valueName: String): Null<String> {
+		return switch(t) {
+			case TDynamic(_): null;
+			case TAbstract(aRef, params): {
+				final a = aRef.get();
+				switch(a.name) {
+					case "Any": null;
+					case "Int": valueName + " is int";
+					case "Float": valueName + " is float";
+					case "Bool": valueName + " is bool";
+					case _: {
+						// Follow the abstract to its underlying type.
+						final followed = haxe.macro.TypeTools.followWithAbstracts(t);
+						switch(followed) {
+							case TAbstract(aRef2, _) if(aRef2.get().name == a.name): null;
+							case _: excCatchCondition(followed, valueName);
+						}
+					}
+				}
+			}
+			case TInst(cRef, _): {
+				final cls = cRef.get();
+				if(cls.name == "String" && cls.pack.length == 0) {
+					valueName + " is String";
+				} else if(cls.name == "Exception" && cls.pack.length == 1 && cls.pack[0] == "haxe") {
+					// haxe.Exception catches everything in Haxe semantics.
+					null;
+				} else {
+					valueName + " is " + typeCompiler.compileClassName(cls);
+				}
+			}
+			case TType(_, _) | TLazy(_) | TMono(_): {
+				final followed = haxe.macro.TypeTools.follow(t);
+				switch(followed) {
+					case TType(_, _): null;
+					case _: excCatchCondition(followed, valueName);
+				}
+			}
+			case _: null;
+		}
 	}
 
 	function constantToGDScript(constant: TConstant): String {
