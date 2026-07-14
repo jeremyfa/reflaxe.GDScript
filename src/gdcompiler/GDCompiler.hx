@@ -315,11 +315,50 @@ class GDCompiler extends reflaxe.DirectToStringCompiler {
 	}
 
 	/**
+		Unique id source for guarded-assignment temporaries.
+	**/
+	var excAssignTempCounter: Int = 0;
+
+	/**
 		Compiles a statement, prepending hoisted content (e.g. multiline
 		lambdas lifted out of call arguments) and appending exception
 		propagation checks.
+
+		Assignments to EXISTING targets whose right-hand side may throw are
+		guarded through a temporary: in Haxe an exception aborts the
+		assignment and the target keeps its previous value (relied on by
+		`try v = f() catch(e) {}` probing patterns).
 	**/
 	function excCompileStatement(stmt: TypedExpr): Null<String> {
+		final canUnwind = excFuncStack.length > 0 || excCurrentTry() != null;
+		switch(stmt.expr) {
+			case TBinop(op = (OpAssign | OpAssignOp(_)), lhs, rhs)
+				if(canUnwind && excExprCanThrow(rhs) && !excExprCanThrow(lhs)): {
+				excUsed = true;
+				final tmp = "_hx_a" + (excAssignTempCounter++);
+				final rhsParts = excCompileWithPre(rhs);
+				final assignExpr: TypedExpr = {
+					expr: TBinop(op, lhs, { expr: TIdent(tmp), pos: rhs.pos, t: rhs.t }),
+					pos: stmt.pos,
+					t: stmt.t
+				};
+				final assignParts = excCompileWithPre(assignExpr);
+				if(rhsParts != null && assignParts != null) {
+					final check = "if " + excClassName + ".active:\n\t" + excUnwindLine();
+					final suffix = excPostStatement(assignExpr);
+					final lines = [];
+					for(l in rhsParts.pre) lines.push(l);
+					lines.push("var " + tmp + " = " + rhsParts.code);
+					lines.push(check);
+					for(l in assignParts.pre) lines.push(l);
+					lines.push(assignParts.code);
+					if(suffix != null) lines.push(suffix);
+					return lines.join("\n");
+				}
+			}
+			case _:
+		}
+
 		final savedAllowed = injectionAllowed;
 		final savedContent = injectionContent;
 		injectionAllowed = true;
@@ -337,6 +376,26 @@ class GDCompiler extends reflaxe.DirectToStringCompiler {
 		var full = pre.length > 0 ? (pre.join("\n") + "\n" + code) : code;
 		final suffix = excPostStatement(stmt);
 		return suffix != null ? (full + "\n" + suffix) : full;
+	}
+
+	/**
+		Compiles an expression with injection capture, returning any hoisted
+		lines separately from the expression code.
+	**/
+	function excCompileWithPre(e: TypedExpr): Null<{ pre: Array<String>, code: String }> {
+		final savedAllowed = injectionAllowed;
+		final savedContent = injectionContent;
+		injectionAllowed = true;
+		injectionContent = [];
+
+		final code = compileExpression(e);
+
+		final pre = injectionContent;
+		injectionAllowed = savedAllowed;
+		injectionContent = savedContent;
+
+		if(code == null) return null;
+		return { pre: pre, code: code };
 	}
 
 	/**
@@ -1939,6 +1998,21 @@ ${exitTreeLines.length > 0 ? exitTreeLines.join("\n").tab() : "\tpass"}
 					valueName + " is " + typeCompiler.compileClassName(cls);
 				}
 			}
+			case TEnum(eRef, _): {
+				// Enum values are ints (dataless enums) or tagged
+				// Dictionaries; match the representation.
+				final e = eRef.get();
+				if(e.isReflaxeExtern()) {
+					null;
+				} else {
+					switch(enumCompiler.getCompileKind(e)) {
+						case GDScriptEnum | AsInt: valueName + " is int";
+						case AsDictionary:
+							"(typeof(" + valueName + ") == TYPE_DICTIONARY and "
+								+ valueName + ".get(\"_hx_enum\") == \"" + EnumCompiler.enumDottedName(e) + "\")";
+					}
+				}
+			}
 			case TType(_, _) | TLazy(_) | TMono(_): {
 				final followed = haxe.macro.TypeTools.follow(t);
 				switch(followed) {
@@ -2070,6 +2144,16 @@ ${exitTreeLines.length > 0 ? exitTreeLines.join("\n").tab() : "\tpass"}
 			if(checkForPrimitiveStringAddition(e2, e1)) gdExpr1 = "HxDyn.hx_string(" + gdExpr1 + ")";
 		}
 
+		// Addition between dynamically-typed values follows Haxe semantics:
+		// if either side is a String the result is concatenation.
+		switch(op) {
+			case OpAdd if(isUntypedOperand(e1) || isUntypedOperand(e2)): {
+				hxDynUsed = true;
+				return "HxDyn.plus(" + gdExpr1 + ", " + gdExpr2 + ")";
+			}
+			case _:
+		}
+
 		// Equality between dynamically-typed values: GDScript errors on ==
 		// with mismatched operand types (Object vs Array, ...), while Haxe
 		// equality is just false. Null-literal comparisons stay direct.
@@ -2171,6 +2255,37 @@ ${exitTreeLines.length > 0 ? exitTreeLines.join("\n").tab() : "\tpass"}
 			+ "\t\t_:\n"
 			+ "\t\t\tpass\n"
 			+ "\treturn v\n\n\n"
+			+ "# Guarded dynamic method call: a missing method raises a\n"
+			+ "# catchable Haxe exception instead of a native error.\n"
+			+ "static func call_method(o, name: String, args: Array):\n"
+			+ "\tmatch typeof(o):\n"
+			+ "\t\tTYPE_OBJECT:\n"
+			+ "\t\t\tif o == null:\n"
+			+ "\t\t\t\treturn HxExc.throw_val(\"Cannot call \" + name + \" on null\")\n"
+			+ "\t\t\tif o.has_method(name):\n"
+			+ "\t\t\t\treturn o.callv(name, args)\n"
+			+ "\t\t\tvar v = o.get(name)\n"
+			+ "\t\t\tif typeof(v) == TYPE_CALLABLE:\n"
+			+ "\t\t\t\treturn v.callv(args)\n"
+			+ "\t\t\treturn HxExc.throw_val(\"No such method \" + name)\n"
+			+ "\t\tTYPE_DICTIONARY:\n"
+			+ "\t\t\tvar v = o.get(name)\n"
+			+ "\t\t\tif typeof(v) == TYPE_CALLABLE:\n"
+			+ "\t\t\t\treturn v.callv(args)\n"
+			+ "\t\t\treturn HxExc.throw_val(\"No such method \" + name)\n"
+			+ "\t\tTYPE_NIL:\n"
+			+ "\t\t\treturn HxExc.throw_val(\"Cannot call \" + name + \" on null\")\n"
+			+ "\t\t_:\n"
+			+ "\t\t\t# Builtin Variant methods (String, Array, ...)\n"
+			+ "\t\t\treturn Callable.create(o, name).callv(args)\n\n\n"
+			+ "# Haxe-style dynamic addition: String on either side means\n"
+			+ "# concatenation; anything else adds numerically.\n"
+			+ "static func plus(a, b):\n"
+			+ "\tvar ta := typeof(a)\n"
+			+ "\tvar tb := typeof(b)\n"
+			+ "\tif ta == TYPE_STRING or tb == TYPE_STRING or ta == TYPE_STRING_NAME or tb == TYPE_STRING_NAME:\n"
+			+ "\t\treturn hx_string(a) + hx_string(b)\n"
+			+ "\treturn a + b\n\n\n"
 			+ "# Haxe-style equality: GDScript errors comparing mismatched\n"
 			+ "# Variant types (Object vs Array, ...), Haxe returns false.\n"
 			+ "static func eq(a, b) -> bool:\n"
@@ -2286,16 +2401,30 @@ ${exitTreeLines.length > 0 ? exitTreeLines.join("\n").tab() : "\tpass"}
 		if(code != null) {
 			result.add(code);
 		} else {
-			// Dynamic field CALLS dispatch directly (native methods reached
-			// through untyped access); reads compile through HxDyn instead.
+			// Dynamic field CALLS: statically-typed receivers (untyped access
+			// to native String/Array methods) dispatch directly; Dynamic
+			// receivers go through a guarded helper so a missing method
+			// becomes a catchable Haxe exception instead of a native error.
 			switch(calledExpr.unwrapParenthesis().expr) {
 				case TField(obj, FDynamic(fieldName)): {
-					result.add(compileExpressionOrError(obj));
-					result.add(".");
-					result.add(compileVarName(fieldName));
-					result.add("(");
-					result.add(arguments.map(e -> compileCallArg(e)).join(", "));
-					result.add(")");
+					if(isUntypedOperand(obj)) {
+						hxDynUsed = true;
+						excUsed = true;
+						result.add("HxDyn.call_method(");
+						result.add(compileExpressionOrError(obj));
+						result.add(", \"");
+						result.add(compileVarName(fieldName));
+						result.add("\", [");
+						result.add(arguments.map(e -> compileCallArg(e)).join(", "));
+						result.add("])");
+					} else {
+						result.add(compileExpressionOrError(obj));
+						result.add(".");
+						result.add(compileVarName(fieldName));
+						result.add("(");
+						result.add(arguments.map(e -> compileCallArg(e)).join(", "));
+						result.add(")");
+					}
 					return result;
 				}
 				case _:
