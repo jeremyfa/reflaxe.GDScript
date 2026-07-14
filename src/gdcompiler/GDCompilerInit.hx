@@ -57,6 +57,10 @@ class GDCompilerInit {
 			fileOutputExtension: ".gd",
 			outputDirDefineName: "gdscript-output",
 			fileOutputType: FilePerClass,
+			// Skips both stale-output deletion and the _GeneratedFiles.json
+			// metadata file; builds relying on it should clean their output
+			// directory themselves.
+			deleteOldOutput: #if gdscript_no_generated_files_list false #else true #end,
 			ignoreTypes: [],
 			reservedVarNames: reservedNames(),
 			targetCodeInjectionName: "__gdscript__",
