@@ -558,7 +558,22 @@ class GDCompiler extends reflaxe.DirectToStringCompiler {
 			+ "static func throw_val(v) -> Variant:\n"
 			+ "\tval = v\n"
 			+ "\tactive = true\n"
-			+ "\treturn null\n";
+			+ "\treturn null\n\n\n"
+			+ "# Consumes a pending exception, returning its value, or null when\n"
+			+ "# none is pending. Call this from GDScript code that invokes this\n"
+			+ "# library: an exception that escapes to a non-Haxe caller has no\n"
+			+ "# catch dispatch to consume it, so the flag would stay set and every\n"
+			+ "# later call into the library would short-circuit and do nothing.\n"
+			+ "static func take() -> Variant:\n"
+			+ "\tif not active:\n"
+			+ "\t\treturn null\n"
+			+ "\tvar v = val\n"
+			+ "\tval = null\n"
+			+ "\tactive = false\n"
+			+ "\treturn v\n\n\n"
+			+ "# True when an exception is waiting to be consumed by take().\n"
+			+ "static func pending() -> bool:\n"
+			+ "\treturn active\n";
 	}
 
 	#if generate_resource_export_list
