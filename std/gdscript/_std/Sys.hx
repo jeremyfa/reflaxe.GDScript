@@ -60,11 +60,11 @@ extern class Sys {
 	}
 
 	@:runtime public inline static function time(): Float {
-		throw "Sys.time not implemented for GDScript.";
+		return untyped __gdscript__("Time.get_unix_time_from_system()");
 	}
 
 	@:runtime public inline static function cpuTime(): Float {
-		return untyped __gdscript__("(Time.get_ticks_msec() * 1000)");
+		return untyped __gdscript__("(Time.get_ticks_msec() / 1000.0)");
 	}
 
 	@:deprecated("Use programPath instead")
