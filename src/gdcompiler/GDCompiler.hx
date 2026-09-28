@@ -829,6 +829,25 @@ ${exitTreeLines.length > 0 ? exitTreeLines.join("\n").tab() : "\tpass"}
 		return !cls.isInterface && super.shouldGenerateClass(cls);
 	}
 
+	/**
+		Runs the expression preprocessors on a class variable initializer, the way
+		they run on function bodies: the initializer becomes the body of a function
+		returning its value. The result is a block ending with that return.
+	**/
+	function sanitizeVarInitializer(classType: ClassType, v: ClassVarData, e: TypedExpr): TypedExpr {
+		final body: TypedExpr = {
+			expr: TBlock([{ expr: TReturn(e), pos: e.pos, t: e.t }]),
+			pos: e.pos,
+			t: e.t
+		};
+		final data = new ClassFuncData(
+			"_hx_init_" + v.field.name, classType, v.field, v.isStatic, MethNormal, e.t,
+			[], null, body, false
+		);
+		data.applyPreprocessors(this, expressionPreprocessors);
+		return data.expr ?? body;
+	}
+
 	public function compileClassImpl(classType: ClassType, varFields: Array<ClassVarData>, funcFields: Array<ClassFuncData>): Null<String> {
 		#if (eval && reflaxe_gdscript_measure)
 		final classMeasure = new reflaxe.debug.MeasurePerformance();
@@ -962,26 +981,36 @@ ${exitTreeLines.length > 0 ? exitTreeLines.join("\n").tab() : "\tpass"}
 			} else {
 				final e = field.expr() ?? v.findDefaultExpr();
 				if(e != null && !e.isStaticField("gdscript.Syntax", "NoAssign", true)) {
-					// Do quick and dirty optimizations for "block-like" variable assignments.
-					// TODO: Incorporate as feature in Reflaxe.
-					final tvr = new RemoveTemporaryVariablesImpl(AllVariables, e, new Map());
-					final simplified = RemoveSingleExpressionBlocksImpl.process(tvr.fixTemporaries());
+					// Reflaxe only runs the expression preprocessors on functions, so an
+					// initializer would keep value-position blocks, ifs and increments
+					// as is (invalid GDScript). Sanitize it as the body of a function
+					// returning the value, like any other function body.
+					final stmts = sanitizeVarInitializer(classType, v, e).unwrapBlock().copy();
+					final single = stmts.length == 1 ? switch(stmts[0].expr) {
+						case TReturn(value) if(value != null): value;
+						case _: null;
+					} : null;
 
-					var compiled = compileClassVarExpr(simplified);
-					if(compiled.indexOf("\n") >= 0) {
+					var compiled: Null<String> = null;
+					if(single != null) {
+						// Do quick and dirty optimizations for "block-like" variable assignments.
+						// TODO: Incorporate as feature in Reflaxe.
+						final tvr = new RemoveTemporaryVariablesImpl(AllVariables, single, new Map());
+						final simplified = RemoveSingleExpressionBlocksImpl.process(tvr.fixTemporaries());
+						compiled = compileClassVarExpr(simplified);
+					}
+					if(compiled == null || compiled.indexOf("\n") >= 0) {
 						// Multi-statement initializer: GDScript variable
 						// initializers are single expressions, so compile the
-						// original block into a generated init function whose
-						// last expression becomes the return value.
+						// sanitized body into a generated init function, which
+						// already ends with the return of the value.
 						final helperName = "_hx_init_" + name;
-						final stmts = e.unwrapBlock().copy();
-						final last = stmts.length > 0 ? stmts.pop() : null;
 						final body = new StringBuf();
-						for(s in stmts) {
-							final c = excCompileStatement(s);
-							if(c != null) body.add(c + "\n");
+						for(i in 0...stmts.length) {
+							final c = excCompileStatement(stmts[i]);
+							if(c != null) body.add(c + (i < stmts.length - 1 ? "\n" : ""));
 						}
-						body.add("return " + (last != null ? compileExpressionOrError(last) : "null"));
+						if(stmts.length == 0) body.add("return null");
 						initHelper = (v.isStatic ? "static " : "") + "func " + helperName + "():\n" + body.toString().tab();
 						compiled = helperName + "()";
 					}
