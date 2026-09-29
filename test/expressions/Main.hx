@@ -2,7 +2,8 @@
 	Expressions that GDScript can't write inline and that the compiler must
 	lower into statements: increments and assignments used as values (also in
 	the branches of an assigned `if` or `switch`), and blocks, ifs and
-	short-circuits inside class variable initializers.
+	short-circuits inside class variable initializers. Also nullable primitives
+	added to a String, which GDScript refuses without a conversion.
 **/
 class Main {
 	static var results: Array<String> = [];
@@ -16,6 +17,11 @@ class Main {
 	};
 	static final IF_IN_INIT = [1, 2].length > 1 ? "long" : "short";
 	static final SHORT_CIRCUIT_IN_INIT = [1, 2].length > 1 && [3].length == 1 ? "yes" : "no";
+
+	// Values from a function, so that the compiler can't fold the additions
+	static function nullable<T>(v: T): Null<T> {
+		return v;
+	}
 
 	static function check(label: String, cond: Bool) {
 		results.push((cond ? "PASS " : "FAIL ") + label);
@@ -58,6 +64,15 @@ class Main {
 		check("postfix in initializer", POSTFIX_IN_INIT == 56);
 		check("if in initializer", IF_IN_INIT == "long");
 		check("short-circuit in initializer", SHORT_CIRCUIT_IN_INIT == "yes");
+
+		// Nullable primitives added to a String
+		final n: Null<Int> = nullable(3);
+		final none: Null<Int> = nullable(null);
+		final ratio: Null<Float> = nullable(1.5);
+		final flag: Null<Bool> = nullable(true);
+		check("nullable int in string", "n=" + n == "n=3" && 'n=$n' == "n=3");
+		check("null int in string", "m=" + none == "m=null");
+		check("nullable float and bool in string", "r=" + ratio + " f=" + flag == "r=1.5 f=true");
 
 		var fails = 0;
 		for(r in results) {

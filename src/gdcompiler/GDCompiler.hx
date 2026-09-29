@@ -2246,7 +2246,22 @@ ${exitTreeLines.length > 0 ? exitTreeLines.join("\n").tab() : "\tpass"}
 	}
 
 	inline function checkForPrimitiveStringAddition(strExpr: TypedExpr, primExpr: TypedExpr) {
-		return strExpr.t.isString() && primExpr.t.isPrimitive();
+		return strExpr.t.isString() && isPrimitiveOrNullablePrimitive(primExpr.t);
+	}
+
+	/**
+		Whether a type is Int, Float or Bool, or Null of one of them. GDScript
+		refuses `String + int` at runtime whatever the static type said, so a
+		`Null<Int>` added to a String needs the same conversion as an `Int`.
+	**/
+	function isPrimitiveOrNullablePrimitive(t: Type): Bool {
+		if(t.isPrimitive()) return true;
+		return switch(haxe.macro.TypeTools.follow(t)) {
+			case TAbstract(_.get() => abs, [inner]) if(abs.pack.length == 0 && abs.name == "Null"): {
+				haxe.macro.TypeTools.follow(inner).isPrimitive();
+			}
+			case followed: followed.isPrimitive();
+		}
 	}
 
 	function isFloatModOperand(e: TypedExpr): Bool {
