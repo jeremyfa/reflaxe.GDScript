@@ -1161,7 +1161,17 @@ ${exitTreeLines.length > 0 ? exitTreeLines.join("\n").tab() : "\tpass"}
 			if(f.kind == MethDynamic) {
 				// ----------------------
 				// Reassignable function
-				final e = field.expr();
+				// The raw field expression was never preprocessed: its body could keep
+				// value-position blocks (inlined calls), invalid in GDScript. Rebuild
+				// the function around the preprocessed body, like a normal method.
+				var e = field.expr();
+				if(e != null && f.expr != null) {
+					switch(e.expr) {
+						case TFunction(tfunc):
+							e = { expr: TFunction({ args: tfunc.args, t: tfunc.t, expr: f.expr }), pos: e.pos, t: e.t };
+						case _:
+					}
+				}
 				final callable = e == null ? "func():\n\tpass" : compileClassVarExpr(e);
 
 				final funcDeclaration = new StringBuf();

@@ -5,6 +5,36 @@
 	short-circuits inside class variable initializers. Also nullable primitives
 	added to a String, which GDScript refuses without a conversion.
 **/
+
+/**
+	A dynamic method is a class variable holding a function: its body must be
+	lowered like the body of any other method.
+**/
+class Handler {
+	final values: Map<String, String> = new Map();
+
+	public function new() {
+		values.set("k", "v");
+	}
+
+	// A loop over an iterator: a call that can throw
+	function lookup(key: String): String {
+		for(k in values.keys()) {
+			if(k == key) return k;
+		}
+		return key;
+	}
+
+	public dynamic function read(key: String, callback: (String) -> Void): Void {
+		final k = lookup(key);
+		if(values.exists(k)) {
+			callback(values.get(k));
+			return;
+		}
+		callback(null);
+	}
+}
+
 class Main {
 	static var results: Array<String> = [];
 
@@ -64,6 +94,11 @@ class Main {
 		check("postfix in initializer", POSTFIX_IN_INIT == 56);
 		check("if in initializer", IF_IN_INIT == "long");
 		check("short-circuit in initializer", SHORT_CIRCUIT_IN_INIT == "yes");
+
+		// Inlined map calls in the body of a dynamic method
+		var read: Null<String> = null;
+		new Handler().read("k", v -> read = v);
+		check("inlined calls in a dynamic method", read == "v");
 
 		// Nullable primitives added to a String
 		final n: Null<Int> = nullable(3);
