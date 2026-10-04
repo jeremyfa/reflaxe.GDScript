@@ -109,6 +109,18 @@ class Main {
 		check("null int in string", "m=" + none == "m=null");
 		check("nullable float and bool in string", "r=" + ratio + " f=" + flag == "r=1.5 f=true");
 
+		// Control characters in string literals: written raw, some of them end
+		// the GDScript literal or the line
+		final controls = "a\x01b\x1Bc\x7Fd\x0Be\x0Cf";
+		check("control characters in a literal", controls.length == 11
+			&& controls.charCodeAt(1) == 0x01 && controls.charCodeAt(3) == 0x1B
+			&& controls.charCodeAt(5) == 0x7F && controls.charCodeAt(7) == 0x0B
+			&& controls.charCodeAt(9) == 0x0C);
+		// A Godot string can't hold a nul character: the engine replaces it with
+		// U+FFFD. The literal must still parse, and keep its length
+		final nul = "x\x00y";
+		check("nul character in a literal", nul.length == 3 && nul.charCodeAt(2) == "y".code);
+
 		var fails = 0;
 		for(r in results) {
 			trace(r);

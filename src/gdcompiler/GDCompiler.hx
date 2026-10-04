@@ -2132,7 +2132,28 @@ ${exitTreeLines.length > 0 ? exitTreeLines.join("\n").tab() : "\tpass"}
 		result = StringTools.replace(result, "\t", "\\t");
 		result = StringTools.replace(result, "\n", "\\n");
 		result = StringTools.replace(result, "\r", "\\r");
-		return "\"" + result + "\"";
+		return "\"" + escapeControlCharacters(result) + "\"";
+	}
+
+	/**
+		Writes the other control characters as `\uXXXX`: written raw, some of them
+		end the GDScript literal (a nul character) or the line.
+	**/
+	function escapeControlCharacters(s: String): String {
+		var buf: Null<StringBuf> = null;
+		for(i in 0...s.length) {
+			final c = StringTools.fastCodeAt(s, i);
+			if(c < 0x20 || c == 0x7F) {
+				if(buf == null) {
+					buf = new StringBuf();
+					buf.add(s.substr(0, i));
+				}
+				buf.add("\\u" + StringTools.hex(c, 4));
+			} else if(buf != null) {
+				buf.addChar(c);
+			}
+		}
+		return buf == null ? s : buf.toString();
 	}
 
 	function binopToGDScript(op: Binop, e1: TypedExpr, e2: TypedExpr): String {
