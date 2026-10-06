@@ -121,6 +121,22 @@ class Main {
 		final nul = "x\x00y";
 		check("nul character in a literal", nul.length == 3 && nul.charCodeAt(2) == "y".code);
 
+		// Arrays and structures compare by identity, typed or not
+		final arr1 = [1, 2];
+		final arr2 = [1, 2];
+		final arrAny1: Any = arr1;
+		final arrAny2: Any = arr2;
+		final sameArr: Any = arr1;
+		check("typed arrays by identity", arr1 == arr1 && arr1 != arr2 && !(arr1 == arr2));
+		check("dynamic arrays by identity", arrAny1 == sameArr && arrAny1 != arrAny2);
+		final st1 = { k: 1 };
+		final st2 = { k: 1 };
+		final stAny1: Dynamic = st1;
+		final stAny2: Dynamic = st2;
+		final sameSt: Dynamic = st1;
+		check("typed structures by identity", st1 == st1 && st1 != st2);
+		check("dynamic structures by identity", stAny1 == sameSt && stAny1 != stAny2);
+
 		var fails = 0;
 		for(r in results) {
 			trace(r);

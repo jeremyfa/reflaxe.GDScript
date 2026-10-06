@@ -2261,9 +2261,15 @@ ${exitTreeLines.length > 0 ? exitTreeLines.join("\n").tab() : "\tpass"}
 		// Equality between dynamically-typed values: GDScript errors on ==
 		// with mismatched operand types (Object vs Array, ...), while Haxe
 		// equality is just false. Null-literal comparisons stay direct.
+		// Arrays and anonymous structures compare by identity in Haxe, while
+		// GDScript's == compares Array and Dictionary by content.
 		switch(op) {
 			case OpEq | OpNotEq: {
 				final nullLiteral = isNullLiteral(e1) || isNullLiteral(e2);
+				if(!nullLiteral && (isIdentityOperand(e1) || isIdentityOperand(e2))) {
+					final call = "is_same(" + gdExpr1 + ", " + gdExpr2 + ")";
+					return op == OpNotEq ? ("!" + call) : call;
+				}
 				if(!nullLiteral && (isUntypedOperand(e1) || isUntypedOperand(e2))) {
 					hxDynUsed = true;
 					final call = "HxDyn.eq(" + gdExpr1 + ", " + gdExpr2 + ")";
@@ -2305,6 +2311,19 @@ ${exitTreeLines.length > 0 ? exitTreeLines.join("\n").tab() : "\tpass"}
 	function isNullLiteral(e: TypedExpr): Bool {
 		return switch(e.unwrapParenthesis().expr) {
 			case TConst(TNull): true;
+			case _: false;
+		}
+	}
+
+	/**
+		Whether an operand is typed as an Array or an anonymous structure,
+		which become a GDScript Array or Dictionary: Haxe compares them by
+		identity.
+	**/
+	function isIdentityOperand(e: TypedExpr): Bool {
+		return switch(haxe.macro.TypeTools.follow(e.t)) {
+			case TInst(_.get() => cls, _): cls.pack.length == 0 && cls.name == "Array";
+			case TAnonymous(_): true;
 			case _: false;
 		}
 	}
@@ -2407,10 +2426,13 @@ ${exitTreeLines.length > 0 ? exitTreeLines.join("\n").tab() : "\tpass"}
 			+ "\treturn a + b\n\n\n"
 			+ "# Haxe-style equality: GDScript errors comparing mismatched\n"
 			+ "# Variant types (Object vs Array, ...), Haxe returns false.\n"
+			+ "# Arrays and structures (not enums) compare by identity.\n"
 			+ "static func eq(a, b) -> bool:\n"
 			+ "\tvar ta := typeof(a)\n"
 			+ "\tvar tb := typeof(b)\n"
 			+ "\tif ta == tb:\n"
+			+ "\t\tif ta == TYPE_ARRAY or (ta == TYPE_DICTIONARY and not a.has(\"_hx_enum\")):\n"
+			+ "\t\t\treturn is_same(a, b)\n"
 			+ "\t\treturn a == b\n"
 			+ "\tif (ta == TYPE_INT or ta == TYPE_FLOAT) and (tb == TYPE_INT or tb == TYPE_FLOAT):\n"
 			+ "\t\treturn a == b\n"
