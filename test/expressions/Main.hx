@@ -137,6 +137,16 @@ class Main {
 		check("typed structures by identity", st1 == st1 && st1 != st2);
 		check("dynamic structures by identity", stAny1 == sameSt && stAny1 != stAny2);
 
+		// Increment and decrement of an array element: the read is a helper call,
+		// which is not a valid assignment target
+		final counts = [0, 0, 0];
+		counts[1]++;
+		++counts[2];
+		counts[2]--;
+		final at = 1;
+		counts[at + 1]++;
+		check("increment of an array element", counts[0] == 0 && counts[1] == 1 && counts[2] == 1);
+
 		var fails = 0;
 		for(r in results) {
 			trace(r);

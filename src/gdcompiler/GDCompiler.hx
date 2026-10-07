@@ -2733,6 +2733,13 @@ ${exitTreeLines.length > 0 ? exitTreeLines.join("\n").tab() : "\tpass"}
 						final name = cfRef.get().name;
 						return "HxDyn.set_field(" + objCode + ", \"" + name + "\", HxDyn.get_field(" + objCode + ", \"" + name + "\") " + opStr + " 1)";
 					}
+					// Array elements read via HxArr.get_at, same as above
+					case TArray(arr, idx) if(isHaxeArrayType(arr.t)): {
+						hxArrUsed = true;
+						final arrCode = compileExpressionOrError(arr);
+						final idxCode = compileExpressionOrError(idx);
+						return "HxArr.set_at(" + arrCode + ", " + idxCode + ", HxArr.get_at(" + arrCode + ", " + idxCode + ") " + opStr + " 1)";
+					}
 					case _:
 				}
 				return gdExpr + " " + opStr + "= 1";
