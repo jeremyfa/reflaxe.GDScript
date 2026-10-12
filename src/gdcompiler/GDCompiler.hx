@@ -1570,7 +1570,10 @@ ${exitTreeLines.length > 0 ? exitTreeLines.join("\n").tab() : "\tpass"}
 				}
 
 				if(!isEmptyConstructorSuperCall) {
-					result.add(callToGDScript(e, el, expr));
+					// As a String: in the macro interpreter, adding a StringBuf
+					// that holds characters beyond ASCII to another one fails
+					// (Invalid_argument "index out of bounds")
+					result.add(callToGDScript(e, el, expr).toString());
 				}
 			}
 			case TNew(classTypeRef, _, el): {
@@ -1677,17 +1680,17 @@ ${exitTreeLines.length > 0 ? exitTreeLines.join("\n").tab() : "\tpass"}
 				final t = excCurrentTry();
 				if(t != null) t.loopDepth++;
 				excFuncLoopDepth++;
-				result.add(toIndentedScope(blockExpr));
+				result.add(toIndentedScope(blockExpr).toString());
 				excFuncLoopDepth--;
 				if(t != null) t.loopDepth--;
 			}
 			case TIf(econd, ifExpr, elseExpr): {
 				result.addMulti("if ", compileExpressionOrError(econd), ":\n");
-				result.add(toIndentedScope(ifExpr));
+				result.add(toIndentedScope(ifExpr).toString());
 				if(elseExpr != null) {
 					result.add("\n");
 					result.add("else:\n");
-					result.add(toIndentedScope(elseExpr));
+					result.add(toIndentedScope(elseExpr).toString());
 				}
 			}
 			case TWhile(econd, blockExpr, normalWhile): {
@@ -1697,7 +1700,7 @@ ${exitTreeLines.length > 0 ? exitTreeLines.join("\n").tab() : "\tpass"}
 					result.addMulti("while ", gdCond, ":\n");
 					if(t != null) t.loopDepth++;
 					excFuncLoopDepth++;
-					result.add(toIndentedScope(blockExpr));
+					result.add(toIndentedScope(blockExpr).toString());
 					excFuncLoopDepth--;
 					if(t != null) t.loopDepth--;
 				} else {
@@ -1709,7 +1712,7 @@ ${exitTreeLines.length > 0 ? exitTreeLines.join("\n").tab() : "\tpass"}
 						t: econd.t,
 					});
 					result.add("while true:\n");
-					result.add(toIndentedScope(blockExpr));
+					result.add(toIndentedScope(blockExpr).toString());
 					result.addMulti("\n\tif ", gdCond, ":\n");
 					result.add("\t\tbreak");
 					excFuncLoopDepth--;

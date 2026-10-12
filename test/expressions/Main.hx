@@ -147,6 +147,15 @@ class Main {
 		counts[at + 1]++;
 		check("increment of an array element", counts[0] == 0 && counts[1] == 1 && counts[2] == 1);
 
+		// Texts beyond ASCII as call arguments, and in the bodies of an if and
+		// of a loop: the generator used to crash on them
+		final accented = Std.string("été");
+		check("call argument beyond ASCII", accented == "été" && Std.string("ß😀").length > 0);
+		var inBody = "";
+		if(accented.length > 0) inBody = Std.string("ça");
+		for(i in 0...1) inBody += Std.string("ñ");
+		check("bodies beyond ASCII", inBody == "çañ");
+
 		var fails = 0;
 		for(r in results) {
 			trace(r);
