@@ -160,6 +160,10 @@ class Main {
 		final powers:Array<Float> = [1e0, 1e3, 2.5e2, 1E2, 1e-2];
 		check("float literals with an exponent", powers[0] == 1 && powers[1] == 1000 && powers[2] == 250 && powers[3] == 100 && powers[4] == 0.01);
 
+		// Searching an empty text, as in Haxe
+		final abc = Std.string("abc");
+		check("index of an empty text", abc.indexOf("") == 0 && abc.indexOf("", 2) == 2 && abc.indexOf("", 9) == 3 && abc.lastIndexOf("") == 3 && abc.lastIndexOf("", 1) == 1 && abc.indexOf("c") == 2);
+
 		var fails = 0;
 		for(r in results) {
 			trace(r);

@@ -23,8 +23,10 @@ extern class String {
 	public function toLowerCase(): String;
 
 	@:runtime public inline function indexOf(str: String, ?startIndex: Int): Int {
-		// Haxe allows a null start index (meaning 0).
-		return find(str, startIndex != null ? startIndex : 0);
+		// Haxe allows a null start index (meaning 0). An empty text is found
+		// at the start index, where GDScript finds nothing.
+		final from = startIndex != null ? (startIndex < 0 ? 0 : startIndex) : 0;
+		return str.length == 0 ? (from > length ? length : from) : find(str, from);
 	}
 
 	@:runtime public inline function substr(pos: Int, ?len: Int): String {
@@ -57,6 +59,10 @@ extern class String {
 	}
 
 	@:runtime public inline function lastIndexOf(str: String, ?startIndex: Int): Int {
+		// An empty text is found at the end, or at the start index if before
+		if(str.length == 0) {
+			return startIndex != null && startIndex < length ? (startIndex < 0 ? 0 : startIndex) : length;
+		}
 		return startIndex != null ? rfind(str, startIndex) : rfind(str, -1);
 	}
 
