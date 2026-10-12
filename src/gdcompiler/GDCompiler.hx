@@ -2113,7 +2113,9 @@ ${exitTreeLines.length > 0 ? exitTreeLines.join("\n").tab() : "\tpass"}
 	function constantToGDScript(constant: TConstant): String {
 		switch(constant) {
 			case TInt(i): return Std.string(i);
-			case TFloat(s): return s.indexOf(".") == -1 ? '$s.0' : s;
+			// A literal with an exponent (1e22) is a float as it is: a ".0"
+			// after it would not parse
+			case TFloat(s): return s.indexOf(".") == -1 && s.indexOf("e") == -1 && s.indexOf("E") == -1 ? '$s.0' : s;
 			case TString(s): return stringToGDScript(s);
 			case TBool(b): return b ? "true" : "false";
 			case TNull: return "null";

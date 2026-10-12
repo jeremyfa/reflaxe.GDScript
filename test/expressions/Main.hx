@@ -156,6 +156,10 @@ class Main {
 		for(i in 0...1) inBody += Std.string("ñ");
 		check("bodies beyond ASCII", inBody == "çañ");
 
+		// Float literals with an exponent
+		final powers:Array<Float> = [1e0, 1e3, 2.5e2, 1E2, 1e-2];
+		check("float literals with an exponent", powers[0] == 1 && powers[1] == 1000 && powers[2] == 250 && powers[3] == 100 && powers[4] == 0.01);
+
 		var fails = 0;
 		for(r in results) {
 			trace(r);
